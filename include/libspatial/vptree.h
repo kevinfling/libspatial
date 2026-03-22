@@ -70,6 +70,7 @@ typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_vptree_node {
         struct {
             spatial_vptree_item *SPATIAL_RESTRICT items;
             int item_count;
+            int item_capacity;
         };
     };
 
@@ -153,21 +154,29 @@ SPATIAL_INLINE void spatial_vptree_node_free(spatial_vptree_node *node,
 {
     if (SPATIAL_UNLIKELY(!node)) return;
 
-    if (node->is_leaf) {
-        if (cb && cb->free) {
-            for (int i = 0; i < node->item_count; i++) {
-                cb->free(node->items[i].data, udata);
+    spatial_vptree_node *stk[SPATIAL_VPTREE_MAX_DEPTH * 2];
+    int sp = 0;
+    stk[sp++] = node;
+
+    while (sp > 0) {
+        spatial_vptree_node *n = stk[--sp];
+
+        if (n->is_leaf) {
+            if (cb && cb->free) {
+                for (int i = 0; i < n->item_count; i++) {
+                    cb->free(n->items[i].data, udata);
+                }
             }
+            alloc->free(n->items, alloc->udata);
+        } else {
+            if (cb && cb->free) {
+                cb->free(n->vantage_data, udata);
+            }
+            if (n->left)  stk[sp++] = n->left;
+            if (n->right) stk[sp++] = n->right;
         }
-        alloc->free(node->items, alloc->udata);
-    } else {
-        if (cb && cb->free) {
-            cb->free(node->vantage_data, udata);
-        }
-        spatial_vptree_node_free(node->left, alloc, cb, udata);
-        spatial_vptree_node_free(node->right, alloc, cb, udata);
+        alloc->free(n, alloc->udata);
     }
-    alloc->free(node, alloc->udata);
 }
 
 /* Quickselect for finding median */
@@ -558,24 +567,29 @@ SPATIAL_INLINE bool spatial_vptree_insert(spatial_vptree *vp,
     /* Update leaf bounds */
     spatial_vptree_bounds_include(node, point);
     
-    /* Grow item array */
+    /* Grow item array with exponential capacity */
     int new_count = node->item_count + 1;
-    spatial_vptree_item *new_items = (spatial_vptree_item*)vp->alloc.malloc(
-        sizeof(spatial_vptree_item) * (size_t)new_count, vp->alloc.udata);
-    if (SPATIAL_UNLIKELY(!new_items)) return false;
-    
-    if (node->items) {
-        memcpy(new_items, node->items, 
-               sizeof(spatial_vptree_item) * (size_t)node->item_count);
-        vp->alloc.free(node->items, vp->alloc.udata);
+    if (new_count > node->item_capacity) {
+        int new_cap = node->item_capacity ? node->item_capacity * 2 : 4;
+        if (new_cap < new_count) new_cap = new_count;
+        spatial_vptree_item *new_items = (spatial_vptree_item*)vp->alloc.malloc(
+            sizeof(spatial_vptree_item) * (size_t)new_cap, vp->alloc.udata);
+        if (SPATIAL_UNLIKELY(!new_items)) return false;
+        
+        if (node->items) {
+            memcpy(new_items, node->items,
+                   sizeof(spatial_vptree_item) * (size_t)node->item_count);
+            vp->alloc.free(node->items, vp->alloc.udata);
+        }
+        node->items = new_items;
+        node->item_capacity = new_cap;
     }
     
     for (int i = 0; i < SPATIAL_VPTREE_DIMS; i++) {
-        new_items[node->item_count].point[i] = point[i];
+        node->items[node->item_count].point[i] = point[i];
     }
-    new_items[node->item_count].data = data;
+    node->items[node->item_count].data = data;
     
-    node->items = new_items;
     node->item_count = new_count;
     vp->count++;
     
@@ -615,6 +629,7 @@ SPATIAL_INLINE spatial_vptree_node* spatial_vptree_build_recursive(
         
         memcpy(leaf->items, items, sizeof(spatial_vptree_item) * (size_t)count);
         leaf->item_count = count;
+        leaf->item_capacity = count;
         
         for (int i = 0; i < count; i++) {
             spatial_vptree_bounds_include(leaf, items[i].point);
@@ -771,15 +786,14 @@ SPATIAL_INLINE void spatial_vptree_search(const spatial_vptree *vp,
     if (SPATIAL_UNLIKELY(!vp || !vp->root || !iter)) return;
     
     spatial_num_t query[SPATIAL_VPTREE_DIMS];
-    spatial_num_t radius = (spatial_num_t)0.0;
+    spatial_num_t radius_sq = (spatial_num_t)0.0;
     
     for (int i = 0; i < SPATIAL_VPTREE_DIMS; i++) {
         query[i] = (qmin[i] + qmax[i]) * (spatial_num_t)0.5;
         spatial_num_t half_size = (qmax[i] - qmin[i]) * (spatial_num_t)0.5;
-        radius += half_size * half_size;
+        radius_sq += half_size * half_size;
     }
-    radius = (spatial_num_t)sqrt((double)radius);
-    spatial_num_t radius_sq = radius * radius;
+    spatial_num_t radius = (spatial_num_t)sqrt((double)radius_sq);
     
     spatial_vptree_node *stk[SPATIAL_VPTREE_MAX_DEPTH + 2];
     int sp = 0;
@@ -821,8 +835,14 @@ SPATIAL_INLINE void spatial_vptree_search(const spatial_vptree *vp,
             }
 
             spatial_num_t diff = d - node->mu;
-            if (diff <= radius  && node->left)  stk[sp++] = node->left;
-            if (diff >= -radius && node->right) stk[sp++] = node->right;
+            if (diff <= radius  && node->left) {
+                SPATIAL_PREFETCH(node->left, 0, 3);
+                stk[sp++] = node->left;
+            }
+            if (diff >= -radius && node->right) {
+                SPATIAL_PREFETCH(node->right, 0, 3);
+                stk[sp++] = node->right;
+            }
         }
     }
 }

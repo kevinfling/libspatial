@@ -151,14 +151,22 @@ SPATIAL_INLINE void spatial_quadtree_node_free(spatial_quadtree_node *node,
 {
     if (SPATIAL_UNLIKELY(!node)) return;
     
-    if (node->is_leaf) {
-        spatial_quadtree_item_free_list(node->items, alloc, cb, udata);
-    } else {
-        for (int i = 0; i < SPATIAL_QUADTREE_CHILDREN; i++) {
-            spatial_quadtree_node_free(node->children[i], alloc, cb, udata);
+    spatial_quadtree_node *stk[SPATIAL_QUADTREE_MAX_DEPTH * SPATIAL_QUADTREE_CHILDREN];
+    int sp = 0;
+    stk[sp++] = node;
+    
+    while (sp > 0) {
+        spatial_quadtree_node *n = stk[--sp];
+        
+        if (n->is_leaf) {
+            spatial_quadtree_item_free_list(n->items, alloc, cb, udata);
+        } else {
+            for (int i = 0; i < SPATIAL_QUADTREE_CHILDREN; i++) {
+                if (n->children[i]) stk[sp++] = n->children[i];
+            }
         }
+        alloc->free(n, alloc->udata);
     }
-    alloc->free(node, alloc->udata);
 }
 
 SPATIAL_INLINE int spatial_quadtree_quadrant(const spatial_quadtree_node *node,
@@ -395,8 +403,8 @@ SPATIAL_INLINE bool spatial_quadtree_expand_root(spatial_quadtree *qt,
 }
 
 SPATIAL_INLINE bool spatial_quadtree_insert(spatial_quadtree *qt,
-                                             const spatial_num_t *min,
-                                             const spatial_num_t *max,
+                                             const spatial_num_t *SPATIAL_RESTRICT min,
+                                             const spatial_num_t *SPATIAL_RESTRICT max,
                                              spatial_data_t data)
 {
     if (SPATIAL_UNLIKELY(!qt)) return false;
@@ -469,8 +477,8 @@ SPATIAL_INLINE bool spatial_quadtree_insert(spatial_quadtree *qt,
  * @brief Search for items overlapping query rectangle
  */
 SPATIAL_INLINE void spatial_quadtree_search(const spatial_quadtree *qt,
-                                             const spatial_num_t *qmin,
-                                             const spatial_num_t *qmax,
+                                             const spatial_num_t *SPATIAL_RESTRICT qmin,
+                                             const spatial_num_t *SPATIAL_RESTRICT qmax,
                                              spatial_quadtree_iter_fn iter,
                                              void *udata)
 {
@@ -499,7 +507,10 @@ SPATIAL_INLINE void spatial_quadtree_search(const spatial_quadtree *qt,
             }
         } else {
             for (int i = 0; i < SPATIAL_QUADTREE_CHILDREN; i++) {
-                if (node->children[i]) stk[sp++] = node->children[i];
+                if (node->children[i]) {
+                    SPATIAL_PREFETCH(node->children[i], 0, 3);
+                    stk[sp++] = node->children[i];
+                }
             }
         }
     }

@@ -140,14 +140,22 @@ SPATIAL_INLINE void spatial_octree_node_free(spatial_octree_node *node,
 {
     if (SPATIAL_UNLIKELY(!node)) return;
     
-    if (node->is_leaf) {
-        spatial_octree_item_free_list(node->items, alloc, cb, udata);
-    } else {
-        for (int i = 0; i < SPATIAL_OCTREE_CHILDREN; i++) {
-            spatial_octree_node_free(node->children[i], alloc, cb, udata);
+    spatial_octree_node *stk[SPATIAL_OCTREE_MAX_DEPTH * SPATIAL_OCTREE_CHILDREN];
+    int sp = 0;
+    stk[sp++] = node;
+    
+    while (sp > 0) {
+        spatial_octree_node *n = stk[--sp];
+        
+        if (n->is_leaf) {
+            spatial_octree_item_free_list(n->items, alloc, cb, udata);
+        } else {
+            for (int i = 0; i < SPATIAL_OCTREE_CHILDREN; i++) {
+                if (n->children[i]) stk[sp++] = n->children[i];
+            }
         }
+        alloc->free(n, alloc->udata);
     }
-    alloc->free(node, alloc->udata);
 }
 
 SPATIAL_INLINE int spatial_octree_octant(const spatial_octree_node *node,
@@ -158,11 +166,9 @@ SPATIAL_INLINE int spatial_octree_octant(const spatial_octree_node *node,
     spatial_num_t py = (min[1] + max[1]) * (spatial_num_t)0.5;
     spatial_num_t pz = (min[2] + max[2]) * (spatial_num_t)0.5;
     
-    int octant = 0;
-    if (px >= node->center[0]) octant |= 1;
-    if (py >= node->center[1]) octant |= 2;
-    if (pz >= node->center[2]) octant |= 4;
-    return octant;
+    return ((px >= node->center[0]) ? 1 : 0)
+         | ((py >= node->center[1]) ? 2 : 0)
+         | ((pz >= node->center[2]) ? 4 : 0);
 }
 
 SPATIAL_INLINE void spatial_octree_child_bounds(const spatial_octree_node *node,
@@ -189,28 +195,30 @@ SPATIAL_INLINE bool spatial_octree_node_split(spatial_octree_node *node,
     node->items = NULL;
     node->is_leaf = false;
     
-    for (int i = 0; i < SPATIAL_OCTREE_CHILDREN; i++) {
-        spatial_num_t cmin[SPATIAL_OCTREE_DIMS], cmax[SPATIAL_OCTREE_DIMS];
-        spatial_octree_child_bounds(node, i, cmin, cmax);
-        
-        node->children[i] = spatial_octree_node_new(cmin, cmax, node->depth + 1, alloc);
-        if (SPATIAL_UNLIKELY(!node->children[i])) {
-            for (int j = 0; j < i; j++) {
-                spatial_octree_node_free(node->children[j], alloc, NULL, NULL);
-            }
-            node->is_leaf = true;
-            node->items = items;
-            return false;
-        }
-    }
-    
-    /* Redistribute items */
+    /* Redistribute items, allocating children on demand */
     spatial_octree_item *item = items;
     while (item) {
         spatial_octree_item *next = item->next;
         int octant = spatial_octree_octant(node, item->min, item->max);
-        spatial_octree_node *child = node->children[octant];
         
+        if (SPATIAL_UNLIKELY(!node->children[octant])) {
+            spatial_num_t cmin[SPATIAL_OCTREE_DIMS], cmax[SPATIAL_OCTREE_DIMS];
+            spatial_octree_child_bounds(node, octant, cmin, cmax);
+            node->children[octant] = spatial_octree_node_new(cmin, cmax, node->depth + 1, alloc);
+            if (SPATIAL_UNLIKELY(!node->children[octant])) {
+                for (int j = 0; j < SPATIAL_OCTREE_CHILDREN; j++) {
+                    if (node->children[j]) {
+                        alloc->free(node->children[j], alloc->udata);
+                        node->children[j] = NULL;
+                    }
+                }
+                node->is_leaf = true;
+                node->items = items;
+                return false;
+            }
+        }
+        
+        spatial_octree_node *child = node->children[octant];
         item->next = child->items;
         child->items = item;
         child->item_count++;
@@ -356,8 +364,8 @@ SPATIAL_INLINE bool spatial_octree_expand_root(spatial_octree *ot,
 }
 
 SPATIAL_INLINE bool spatial_octree_insert(spatial_octree *ot,
-                                           const spatial_num_t *min,
-                                           const spatial_num_t *max,
+                                           const spatial_num_t *SPATIAL_RESTRICT min,
+                                           const spatial_num_t *SPATIAL_RESTRICT max,
                                            spatial_data_t data)
 {
     if (SPATIAL_UNLIKELY(!ot)) return false;
@@ -450,6 +458,7 @@ SPATIAL_INLINE void spatial_octree_search(const spatial_octree *ot,
         } else {
             for (int i = 0; i < SPATIAL_OCTREE_CHILDREN; i++) {
                 if (node->children[i]) {
+                    SPATIAL_PREFETCH(node->children[i], 0, 3);
                     stk[sp++] = node->children[i];
                 }
             }
