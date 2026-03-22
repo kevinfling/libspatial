@@ -70,6 +70,7 @@ typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_kdtree_node {
         struct {
             spatial_kdtree_item *SPATIAL_RESTRICT items;
             int item_count;
+            int item_capacity;
         };
     };
 
@@ -149,11 +150,9 @@ SPATIAL_INLINE SPATIAL_CONST spatial_num_t spatial_kdtree_dist_manhattan(
 SPATIAL_INLINE spatial_kdtree_node* spatial_kdtree_node_new_leaf(const spatial_allocator *alloc)
 {
     spatial_kdtree_node *node = (spatial_kdtree_node*)alloc->malloc(sizeof(*node), alloc->udata);
-    memset(node, 0, sizeof(*node));
     if (SPATIAL_UNLIKELY(!node)) return NULL;
+    memset(node, 0, sizeof(*node));
     node->is_leaf = true;
-    node->items = NULL;
-    node->item_count = 0;
     return node;
 }
 
@@ -161,13 +160,11 @@ SPATIAL_INLINE spatial_kdtree_node* spatial_kdtree_node_new_internal(
     int split_axis, spatial_num_t split_pos, const spatial_allocator *alloc)
 {
     spatial_kdtree_node *node = (spatial_kdtree_node*)alloc->malloc(sizeof(*node), alloc->udata);
-    memset(node, 0, sizeof(*node));
     if (SPATIAL_UNLIKELY(!node)) return NULL;
+    memset(node, 0, sizeof(*node));
     node->is_leaf = false;
     node->split_axis = split_axis;
     node->split_pos = split_pos;
-    node->left = NULL;
-    node->right = NULL;
     return node;
 }
 
@@ -178,18 +175,26 @@ SPATIAL_INLINE void spatial_kdtree_node_free(spatial_kdtree_node *node,
 {
     if (SPATIAL_UNLIKELY(!node)) return;
 
-    if (node->is_leaf) {
-        if (cb && cb->free) {
-            for (int i = 0; i < node->item_count; i++) {
-                cb->free(node->items[i].data, udata);
+    spatial_kdtree_node *stk[SPATIAL_KDTREE_MAX_DEPTH * 2];
+    int sp = 0;
+    stk[sp++] = node;
+
+    while (sp > 0) {
+        spatial_kdtree_node *n = stk[--sp];
+
+        if (n->is_leaf) {
+            if (cb && cb->free) {
+                for (int i = 0; i < n->item_count; i++) {
+                    cb->free(n->items[i].data, udata);
+                }
             }
+            alloc->free(n->items, alloc->udata);
+        } else {
+            if (n->left)  stk[sp++] = n->left;
+            if (n->right) stk[sp++] = n->right;
         }
-        alloc->free(node->items, alloc->udata);
-    } else {
-        spatial_kdtree_node_free(node->left, alloc, cb, udata);
-        spatial_kdtree_node_free(node->right, alloc, cb, udata);
+        alloc->free(n, alloc->udata);
     }
-    alloc->free(node, alloc->udata);
 }
 
 /* Incremental split helpers */
@@ -260,8 +265,8 @@ SPATIAL_INLINE bool spatial_kdtree_node_split(spatial_kdtree_node *node,
             right_items[ri++] = node->items[i];
     }
 
-    left->is_leaf = true;  left->items = left_items;  left->item_count = left_count;
-    right->is_leaf = true; right->items = right_items; right->item_count = node->item_count - left_count;
+    left->is_leaf = true;  left->items = left_items;  left->item_count = left_count;  left->item_capacity = left_count;
+    right->is_leaf = true; right->items = right_items; right->item_count = node->item_count - left_count; right->item_capacity = node->item_count - left_count;
 
     spatial_bbox_copy(node->min, node->max, left->min, left->max, SPATIAL_KDTREE_DIMS);
     spatial_bbox_copy(node->min, node->max, right->min, right->max, SPATIAL_KDTREE_DIMS);
@@ -283,8 +288,8 @@ SPATIAL_INLINE bool spatial_kdtree_node_split(spatial_kdtree_node *node,
 
 /* Incremental insert — the hot path */
 SPATIAL_INLINE bool spatial_kdtree_insert(spatial_kdtree *kt,
-                                           const spatial_num_t *min,
-                                           const spatial_num_t *max,
+                                           const spatial_num_t *SPATIAL_RESTRICT min,
+                                           const spatial_num_t *SPATIAL_RESTRICT max,
                                            spatial_data_t data)
 {
     if (SPATIAL_UNLIKELY(!kt)) return false;
@@ -313,26 +318,31 @@ SPATIAL_INLINE bool spatial_kdtree_insert(spatial_kdtree *kt,
         ++depth;
     }
 
-    /* Add to leaf */
+    /* Add to leaf with exponential capacity growth */
     int new_count = node->item_count + 1;
-    spatial_kdtree_item *new_items = (spatial_kdtree_item*)kt->alloc.malloc(
-        sizeof(spatial_kdtree_item) * (size_t)new_count, kt->alloc.udata);
-    if (SPATIAL_UNLIKELY(!new_items)) return false;
+    if (new_count > node->item_capacity) {
+        int new_cap = node->item_capacity ? node->item_capacity * 2 : kt->leaf_size;
+        if (new_cap < new_count) new_cap = new_count;
+        spatial_kdtree_item *new_items = (spatial_kdtree_item*)kt->alloc.malloc(
+            sizeof(spatial_kdtree_item) * (size_t)new_cap, kt->alloc.udata);
+        if (SPATIAL_UNLIKELY(!new_items)) return false;
 
-    if (node->items) {
-        memcpy(new_items, node->items, sizeof(spatial_kdtree_item) * (size_t)node->item_count);
-        kt->alloc.free(node->items, kt->alloc.udata);
+        if (node->items) {
+            memcpy(new_items, node->items, sizeof(spatial_kdtree_item) * (size_t)node->item_count);
+            kt->alloc.free(node->items, kt->alloc.udata);
+        }
+        node->items = new_items;
+        node->item_capacity = new_cap;
     }
 
     for (int i = 0; i < SPATIAL_KDTREE_DIMS; ++i) {
-        new_items[node->item_count].point[i] = point[i];
+        node->items[node->item_count].point[i] = point[i];
         /* Expand leaf bounding box to include new point */
         node->min[i] = spatial_min(node->min[i], point[i]);
         node->max[i] = spatial_max(node->max[i], point[i]);
     }
-    new_items[node->item_count].data = data;
+    node->items[node->item_count].data = data;
 
-    node->items = new_items;
     node->item_count = new_count;
     kt->count++;
 
@@ -385,8 +395,16 @@ SPATIAL_INLINE void spatial_kdtree_search(const spatial_kdtree *kt,
                 }
             }
         } else {
-            if (node->left)  stk[sp++] = node->left;
-            if (node->right) stk[sp++] = node->right;
+            int axis = node->split_axis;
+            spatial_num_t pos = node->split_pos;
+            if (qmin[axis] <= pos && node->left) {
+                SPATIAL_PREFETCH(node->left, 0, 3);
+                stk[sp++] = node->left;
+            }
+            if (qmax[axis] >= pos && node->right) {
+                SPATIAL_PREFETCH(node->right, 0, 3);
+                stk[sp++] = node->right;
+            }
         }
     }
 }
