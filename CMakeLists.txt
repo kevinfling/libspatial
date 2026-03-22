@@ -113,12 +113,14 @@ if(BUILD_BENCHMARKS)
     endif()
     
     # Optimize for benchmarks
+    target_compile_definitions(bench_libspatial PRIVATE SPATIAL_BENCHMARKING)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(bench_libspatial PRIVATE
             -O3
             -march=native
             -ffast-math
             -funroll-loops
+            -DNDEBUG
             -Wno-static-in-inline
         )
     elseif(MSVC)

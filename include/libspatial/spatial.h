@@ -53,6 +53,7 @@ extern "C" {
     #define SPATIAL_UNUSED      __attribute__((unused))
     #define SPATIAL_ALIGNED(x)  __attribute__((aligned(x)))
     #define SPATIAL_RESTRICT    __restrict__
+    #define SPATIAL_PREFETCH(p,rw,loc) __builtin_prefetch((p),(rw),(loc))
 #elif defined(_MSC_VER)
     #define SPATIAL_LIKELY(x)   (x)
     #define SPATIAL_UNLIKELY(x) (x)
@@ -65,6 +66,7 @@ extern "C" {
     #define SPATIAL_UNUSED      __pragma(warning(suppress:4100))
     #define SPATIAL_ALIGNED(x)  __declspec(align(x))
     #define SPATIAL_RESTRICT    __restrict
+    #define SPATIAL_PREFETCH(p,rw,loc) _mm_prefetch((const char*)(p),(loc))
 #else
     #define SPATIAL_LIKELY(x)   (x)
     #define SPATIAL_UNLIKELY(x) (x)
@@ -77,6 +79,7 @@ extern "C" {
     #define SPATIAL_UNUSED
     #define SPATIAL_ALIGNED(x)
     #define SPATIAL_RESTRICT
+    #define SPATIAL_PREFETCH(p,rw,loc) ((void)0)
 #endif
 
 /* ============================================================================
@@ -195,13 +198,13 @@ SPATIAL_INLINE const spatial_allocator* spatial_default_allocator(void) {
     #define SPATIAL_ARENA_FREE(ptr) free(ptr)
 #endif
 
-typedef struct spatial_arena_block {
+typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_arena_block {
     struct spatial_arena_block *next;
     size_t size;
     size_t used;
 } spatial_arena_block;
 
-typedef struct spatial_arena {
+typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_arena {
     spatial_arena_block *head;
 } spatial_arena_t;
 
@@ -245,7 +248,7 @@ SPATIAL_INLINE void spatial_arena_reset(spatial_arena_t *arena) {
 
 SPATIAL_INLINE void* spatial_arena_alloc(spatial_arena_t *arena, size_t size) {
     if (SPATIAL_UNLIKELY(!arena || size == 0)) return NULL;
-    size_t align = _Alignof(max_align_t);
+    size_t align = SPATIAL_CACHE_LINE;
     size_t pad = (align - (size % align)) % align;
     size_t total = size + pad;
 
@@ -335,15 +338,15 @@ SPATIAL_INLINE spatial_allocator spatial_arena_allocator(spatial_arena_t *arena)
     #define SPATIAL_POOL_FREE(ptr) free(ptr)
 #endif
 
-typedef struct spatial_pool_node {
+typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_pool_node {
     struct spatial_pool_node *next;
 } spatial_pool_node;
 
-typedef struct spatial_pool_block {
+typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_pool_block {
     struct spatial_pool_block *next;
 } spatial_pool_block;
 
-typedef struct spatial_pool {
+typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_pool {
     spatial_pool_node *free_list;
     spatial_pool_block *blocks;
     size_t obj_size;
@@ -575,7 +578,7 @@ SPATIAL_INLINE SPATIAL_PURE bool spatial_bbox_overlaps(const spatial_num_t *SPAT
                                                          const spatial_num_t *SPATIAL_RESTRICT b_max,
                                                          int dims) {
     for (int i = 0; i < dims; i++) {
-        if (a_max[i] < b_min[i] || a_min[i] > b_max[i]) {
+        if (SPATIAL_LIKELY(a_max[i] < b_min[i] || a_min[i] > b_max[i])) {
             return false;
         }
     }
@@ -767,7 +770,7 @@ SPATIAL_INLINE double spatial_quickselect_double(double *arr, int *indices, int 
  * Stack Utilities (for non-recursive traversal)
  * ============================================================================ */
 
-typedef struct spatial_stack {
+typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_stack {
     void **items;
     int    capacity;
     int    top;
@@ -796,13 +799,13 @@ SPATIAL_INLINE void spatial_stack_free(spatial_stack *s) {
 }
 
 SPATIAL_INLINE bool spatial_stack_push(spatial_stack *s, void *item) {
-    if (s->top + 1 >= s->capacity) return false;
+    if (SPATIAL_UNLIKELY(s->top + 1 >= s->capacity)) return false;
     s->items[++s->top] = item;
     return true;
 }
 
 SPATIAL_INLINE void* spatial_stack_pop(spatial_stack *s) {
-    if (s->top < 0) return NULL;
+    if (SPATIAL_UNLIKELY(s->top < 0)) return NULL;
     return s->items[s->top--];
 }
 
@@ -819,7 +822,7 @@ typedef struct spatial_pq_node {
     spatial_num_t  dist;
 } spatial_pq_node;
 
-typedef struct spatial_priority_queue {
+typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_priority_queue {
     spatial_pq_node  *nodes;
     int               size;
     int               capacity;

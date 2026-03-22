@@ -32,7 +32,9 @@
 #if defined(__x86_64__) || defined(_M_X64)
     #include <x86intrin.h>
     static inline uint64_t rdtsc(void) {
-        return __rdtsc();
+        uint32_t lo, hi;
+        __asm__ volatile("lfence\n\trdtsc" : "=a"(lo), "=d"(hi));
+        return ((uint64_t)hi << 32) | lo;
     }
 #elif defined(__aarch64__)
     static inline uint64_t rdtsc(void) {
@@ -47,6 +49,12 @@
         return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
     }
 #endif
+
+static void rdtsc_warmup(void) {
+    for (int i = 0; i < 10000; i++) {
+        (void)rdtsc();
+    }
+}
 
 #include "libspatial/libspatial.h"
 
@@ -248,6 +256,13 @@ static bench_result bench_kdtree(int num_items) {
         random_aabb(&points[i * 3], &points[i * 3], 3, 10000.0);
     }
     
+    /* Warmup */
+    for (int i = 0; i < BENCH_WARMUP && i < num_items; i++) {
+        spatial_kdtree_insert(kt, &points[i * 3], &points[i * 3], (void*)(intptr_t)i);
+    }
+    spatial_kdtree_free(kt);
+    kt = spatial_kdtree_new();
+    
     /* Insert */
     uint64_t start = rdtsc();
     for (int i = 0; i < num_items; i++) {
@@ -258,9 +273,10 @@ static bench_result bench_kdtree(int num_items) {
     r.insert_ns = cycles_to_ns(r.insert_cycles);
     
     /* Search */
-    double qmin[3] = {0, 0, 0};
-    double qmax[3] = {5000, 5000, 5000};
+    double qmin[3], qmax[3];
+    random_aabb(qmin, qmax, 3, 10000.0);
     
+    g_hit_count = 0;
     start = rdtsc();
     for (int i = 0; i < BENCH_NUM_QUERIES; i++) {
         spatial_kdtree_search(kt, qmin, qmax, count_callback, NULL);
@@ -298,6 +314,13 @@ static bench_result bench_vptree(int num_items) {
         random_aabb(&points[i * 3], &points[i * 3], 3, 10000.0);
     }
     
+    /* Warmup */
+    for (int i = 0; i < BENCH_WARMUP && i < num_items; i++) {
+        spatial_vptree_insert(vp, &points[i * 3], &points[i * 3], (void*)(intptr_t)i);
+    }
+    spatial_vptree_free(vp);
+    vp = spatial_vptree_new();
+    
     /* Insert */
     uint64_t start = rdtsc();
     for (int i = 0; i < num_items; i++) {
@@ -308,9 +331,10 @@ static bench_result bench_vptree(int num_items) {
     r.insert_ns = cycles_to_ns(r.insert_cycles);
     
     /* Search */
-    double qmin[3] = {0, 0, 0};
-    double qmax[3] = {5000, 5000, 5000};
+    double qmin[3], qmax[3];
+    random_aabb(qmin, qmax, 3, 10000.0);
     
+    g_hit_count = 0;
     start = rdtsc();
     for (int i = 0; i < BENCH_NUM_QUERIES; i++) {
         spatial_vptree_search(vp, qmin, qmax, count_callback, NULL);
@@ -348,6 +372,13 @@ static bench_result bench_hilbertrtree(int num_items) {
     for (int i = 0; i < num_items; i++) {
         random_aabb(&mins[i * 2], &maxs[i * 2], 2, 10000.0);
     }
+    
+    /* Warmup */
+    for (int i = 0; i < BENCH_WARMUP && i < num_items; i++) {
+        spatial_hilbertrtree_insert(rt, &mins[i * 2], &maxs[i * 2], (void*)(intptr_t)i);
+    }
+    spatial_hilbertrtree_free(rt);
+    rt = spatial_hilbertrtree_new();
     
     /* Insert */
     uint64_t start = rdtsc();
@@ -399,6 +430,13 @@ static bench_result bench_bsptree(int num_items) {
         random_aabb(&mins[i * 3], &maxs[i * 3], 3, 10000.0);
     }
     
+    // Warmup
+    for (int i = 0; i < BENCH_WARMUP && i < num_items; i++) {
+        spatial_bsptree_insert(bsp, &mins[i * 3], &maxs[i * 3], (void*)(intptr_t)i);
+    }
+    spatial_bsptree_free(bsp);
+    bsp = spatial_bsptree_new();
+    
     // Insert 
     uint64_t start = rdtsc();
     for (int i = 0; i < num_items; i++) {
@@ -411,9 +449,10 @@ static bench_result bench_bsptree(int num_items) {
     spatial_bsptree_rebuild(bsp);
     
     // Search
-    double qmin[3] = {0, 0, 0};
-    double qmax[3] = {5000, 5000, 5000};
+    double qmin[3], qmax[3];
+    random_aabb(qmin, qmax, 3, 10000.0);
     
+    g_hit_count = 0;
     start = rdtsc();
     for (int i = 0; i < BENCH_NUM_QUERIES; i++) {
         spatial_bsptree_search(bsp, qmin, qmax, count_callback, NULL);
@@ -451,6 +490,13 @@ static bench_result bench_bvh(int num_items) {
         random_aabb(&mins[i * 3], &maxs[i * 3], 3, 10000.0);
     }
     
+    // Warmup
+    for (int i = 0; i < BENCH_WARMUP && i < num_items; i++) {
+        spatial_bvh_insert(bvh, &mins[i * 3], &maxs[i * 3], (void*)(intptr_t)i);
+    }
+    spatial_bvh_free(bvh);
+    bvh = spatial_bvh_new();
+    
     // Insert
     uint64_t start = rdtsc();
     for (int i = 0; i < num_items; i++) {
@@ -464,9 +510,10 @@ static bench_result bench_bvh(int num_items) {
     spatial_bvh_build(bvh);
     
     // Search
-    double qmin[3] = {0, 0, 0};
-    double qmax[3] = {5000, 5000, 5000};
+    double qmin[3], qmax[3];
+    random_aabb(qmin, qmax, 3, 10000.0);
     
+    g_hit_count = 0;
     start = rdtsc();
     for (int i = 0; i < BENCH_NUM_QUERIES; i++) {
         spatial_bvh_search(bvh, qmin, qmax, count_callback, NULL);
@@ -494,7 +541,8 @@ static bench_result bench_bvh(int num_items) {
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     
-    srand((unsigned)time(NULL));
+    srand(42);
+    rdtsc_warmup();
     
     int num_items = 1000000;
     if (argc > 1) {
