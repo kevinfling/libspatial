@@ -55,6 +55,8 @@ typedef struct spatial_bsptree_item {
 
 /* Node structure (cache-line aligned for SIMD-ready traversal) */
 typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_bsptree_node {
+    spatial_num_t min[SPATIAL_BSPTREE_DIMS];
+    spatial_num_t max[SPATIAL_BSPTREE_DIMS];
     spatial_bsp_plane plane;
     struct spatial_bsptree_node *front;
     struct spatial_bsptree_node *back;
@@ -156,6 +158,7 @@ SPATIAL_INLINE spatial_bsptree_node* spatial_bsptree_node_new_leaf(
     spatial_bsptree_node *node = (spatial_bsptree_node*)alloc->malloc(sizeof(spatial_bsptree_node), alloc->udata);
     if (SPATIAL_UNLIKELY(!node)) return NULL;
     
+    spatial_bbox_init(node->min, node->max, SPATIAL_BSPTREE_DIMS);
     node->is_leaf = true;
     node->items = NULL;
     node->item_count = 0;
@@ -175,6 +178,7 @@ SPATIAL_INLINE spatial_bsptree_node* spatial_bsptree_node_new_internal(
     spatial_bsptree_node *node = (spatial_bsptree_node*)alloc->malloc(sizeof(spatial_bsptree_node), alloc->udata);
     if (SPATIAL_UNLIKELY(!node)) return NULL;
     
+    spatial_bbox_init(node->min, node->max, SPATIAL_BSPTREE_DIMS);
     node->is_leaf = false;
     node->depth = depth;
     node->plane = *plane;
@@ -213,8 +217,16 @@ SPATIAL_INLINE void spatial_bsptree_node_free(spatial_bsptree_node *node,
 }
 
 /* ============================================================================
- * Plane selection (axis-aligned or arbitrary)
+ * Plane selection (axis-aligned binned SAH)
  * ============================================================================ */
+
+#define SPATIAL_BSPTREE_NUM_BINS 8
+
+typedef struct {
+    spatial_num_t min[SPATIAL_BSPTREE_DIMS];
+    spatial_num_t max[SPATIAL_BSPTREE_DIMS];
+    int count;
+} spatial_bsptree_bin;
 
 SPATIAL_INLINE void spatial_bsptree_select_plane(
     spatial_bsptree_item *items,
@@ -222,40 +234,117 @@ SPATIAL_INLINE void spatial_bsptree_select_plane(
     bool axis_aligned,
     spatial_bsp_plane *out_plane)
 {
-    if (axis_aligned || SPATIAL_BSPTREE_DIMS <= 3) {
-        /* Axis-aligned split - select longest axis */
-        spatial_num_t min[SPATIAL_BSPTREE_DIMS];
-        spatial_num_t max[SPATIAL_BSPTREE_DIMS];
+    (void)axis_aligned;
+    
+    /* Compute overall bbox */
+    spatial_num_t bmin[SPATIAL_BSPTREE_DIMS];
+    spatial_num_t bmax[SPATIAL_BSPTREE_DIMS];
+    for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+        bmin[d] = items[0].min[d];
+        bmax[d] = items[0].max[d];
+    }
+    for (int i = 1; i < count; i++) {
+        for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+            bmin[d] = spatial_min(bmin[d], items[i].min[d]);
+            bmax[d] = spatial_max(bmax[d], items[i].max[d]);
+        }
+    }
+    
+    spatial_num_t total_sa = spatial_bbox_area(bmin, bmax, SPATIAL_BSPTREE_DIMS);
+    spatial_num_t best_cost = SPATIAL_INFINITY;
+    int best_axis = 0;
+    spatial_num_t best_split_pos = (bmin[0] + bmax[0]) * (spatial_num_t)0.5;
+    
+    for (int axis = 0; axis < SPATIAL_BSPTREE_DIMS; axis++) {
+        spatial_num_t axis_range = bmax[axis] - bmin[axis];
+        if (axis_range < SPATIAL_EPSILON) continue;
         
-        for (int i = 0; i < SPATIAL_BSPTREE_DIMS; i++) {
-            min[i] = items[0].min[i];
-            max[i] = items[0].max[i];
+        spatial_bsptree_bin bins[SPATIAL_BSPTREE_NUM_BINS];
+        memset(bins, 0, sizeof(bins));
+        
+        /* Bin items by center */
+        for (int i = 0; i < count; i++) {
+            spatial_num_t center = (items[i].min[axis] + items[i].max[axis]) * (spatial_num_t)0.5;
+            int bin_idx = (int)((center - bmin[axis]) / axis_range *
+                                (SPATIAL_BSPTREE_NUM_BINS - 0.001));
+            if (bin_idx < 0) bin_idx = 0;
+            if (bin_idx >= SPATIAL_BSPTREE_NUM_BINS) bin_idx = SPATIAL_BSPTREE_NUM_BINS - 1;
+            
+            spatial_bsptree_bin *b = &bins[bin_idx];
+            if (b->count == 0) {
+                spatial_bbox_copy(items[i].min, items[i].max, b->min, b->max, SPATIAL_BSPTREE_DIMS);
+            } else {
+                for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+                    b->min[d] = spatial_min(b->min[d], items[i].min[d]);
+                    b->max[d] = spatial_max(b->max[d], items[i].max[d]);
+                }
+            }
+            b->count++;
         }
         
-        for (int i = 1; i < count; i++) {
-            for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
-                min[d] = spatial_min(min[d], items[i].min[d]);
-                max[d] = spatial_max(max[d], items[i].max[d]);
+        /* Evaluate splits between bins */
+        for (int split = 1; split < SPATIAL_BSPTREE_NUM_BINS; split++) {
+            spatial_num_t left_min[SPATIAL_BSPTREE_DIMS];
+            spatial_num_t left_max[SPATIAL_BSPTREE_DIMS];
+            spatial_num_t right_min[SPATIAL_BSPTREE_DIMS];
+            spatial_num_t right_max[SPATIAL_BSPTREE_DIMS];
+            spatial_bbox_init(left_min, left_max, SPATIAL_BSPTREE_DIMS);
+            spatial_bbox_init(right_min, right_max, SPATIAL_BSPTREE_DIMS);
+            int left_count = 0, right_count = 0;
+            
+            for (int j = 0; j < split; j++) {
+                if (bins[j].count > 0) {
+                    for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+                        left_min[d] = spatial_min(left_min[d], bins[j].min[d]);
+                        left_max[d] = spatial_max(left_max[d], bins[j].max[d]);
+                    }
+                    left_count += bins[j].count;
+                }
+            }
+            for (int j = split; j < SPATIAL_BSPTREE_NUM_BINS; j++) {
+                if (bins[j].count > 0) {
+                    for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+                        right_min[d] = spatial_min(right_min[d], bins[j].min[d]);
+                        right_max[d] = spatial_max(right_max[d], bins[j].max[d]);
+                    }
+                    right_count += bins[j].count;
+                }
+            }
+            
+            if (left_count == 0 || right_count == 0) continue;
+            
+            spatial_num_t left_sa = spatial_bbox_area(left_min, left_max, SPATIAL_BSPTREE_DIMS);
+            spatial_num_t right_sa = spatial_bbox_area(right_min, right_max, SPATIAL_BSPTREE_DIMS);
+            spatial_num_t cost = spatial_sah_cost(total_sa, left_sa, right_sa,
+                                                   left_count, right_count,
+                                                   (spatial_num_t)1.0, (spatial_num_t)1.0);
+            
+            if (cost < best_cost) {
+                best_cost = cost;
+                best_axis = axis;
+                best_split_pos = bmin[axis] + (axis_range * (spatial_num_t)split) /
+                                               (spatial_num_t)SPATIAL_BSPTREE_NUM_BINS;
             }
         }
-        
-        int best_axis = 0;
-        spatial_num_t best_extent = max[0] - min[0];
-        
-        for (int d = 1; d < SPATIAL_BSPTREE_DIMS; d++) {
-            spatial_num_t extent = max[d] - min[d];
+    }
+    
+    /* If SAH didn't find a useful split, fall back to median of longest axis */
+    if (best_cost >= SPATIAL_INFINITY) {
+        spatial_num_t best_extent = (spatial_num_t)0.0;
+        for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+            spatial_num_t extent = bmax[d] - bmin[d];
             if (extent > best_extent) {
                 best_extent = extent;
                 best_axis = d;
             }
         }
-        
-        /* Create axis-aligned plane */
-        for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
-            out_plane->normal[d] = (d == best_axis) ? (spatial_num_t)1.0 : (spatial_num_t)0.0;
-        }
-        out_plane->d = -(min[best_axis] + max[best_axis]) * (spatial_num_t)0.5;
+        best_split_pos = (bmin[best_axis] + bmax[best_axis]) * (spatial_num_t)0.5;
     }
+    
+    for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+        out_plane->normal[d] = (d == best_axis) ? (spatial_num_t)1.0 : (spatial_num_t)0.0;
+    }
+    out_plane->d = -best_split_pos;
 }
 
 /* ============================================================================
@@ -382,6 +471,16 @@ SPATIAL_INLINE bool spatial_bsptree_insert(spatial_bsptree *bsp,
     leaf->item_count++;
     bsp->count++;
     bsp->needs_rebuild = true;
+    
+    /* Expand leaf bbox to include new item */
+    if (leaf->item_count == 1) {
+        spatial_bbox_copy(min, max, leaf->min, leaf->max, SPATIAL_BSPTREE_DIMS);
+    } else {
+        for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+            leaf->min[d] = spatial_min(leaf->min[d], min[d]);
+            leaf->max[d] = spatial_max(leaf->max[d], max[d]);
+        }
+    }
 
     return true;
 }
@@ -409,6 +508,18 @@ SPATIAL_INLINE spatial_bsptree_node* spatial_bsptree_build_recursive(
         
         memcpy(leaf->items, items, sizeof(spatial_bsptree_item) * (size_t)count);
         leaf->item_count = count;
+        
+        /* Compute leaf bbox */
+        for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+            leaf->min[d] = items[0].min[d];
+            leaf->max[d] = items[0].max[d];
+        }
+        for (int i = 1; i < count; i++) {
+            for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+                leaf->min[d] = spatial_min(leaf->min[d], items[i].min[d]);
+                leaf->max[d] = spatial_max(leaf->max[d], items[i].max[d]);
+            }
+        }
         
         return leaf;
     }
@@ -467,6 +578,18 @@ SPATIAL_INLINE spatial_bsptree_node* spatial_bsptree_build_recursive(
 
         memcpy(leaf->items, items, sizeof(spatial_bsptree_item) * (size_t)count);
         leaf->item_count = count;
+        
+        /* Compute leaf bbox */
+        for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+            leaf->min[d] = items[0].min[d];
+            leaf->max[d] = items[0].max[d];
+        }
+        for (int i = 1; i < count; i++) {
+            for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+                leaf->min[d] = spatial_min(leaf->min[d], items[i].min[d]);
+                leaf->max[d] = spatial_max(leaf->max[d], items[i].max[d]);
+            }
+        }
         return leaf;
     }
 
@@ -483,6 +606,12 @@ SPATIAL_INLINE spatial_bsptree_node* spatial_bsptree_build_recursive(
         spatial_bsptree_node_free(node->back, alloc, NULL, NULL);
         alloc->free(node, alloc->udata);
         return NULL;
+    }
+    
+    /* Compute subtree bbox from children */
+    for (int d = 0; d < SPATIAL_BSPTREE_DIMS; d++) {
+        node->min[d] = spatial_min(node->front->min[d], node->back->min[d]);
+        node->max[d] = spatial_max(node->front->max[d], node->back->max[d]);
     }
 
     return node;
@@ -519,6 +648,12 @@ SPATIAL_INLINE void spatial_bsptree_search(const spatial_bsptree *bsp,
 
     while (sp > 0) {
         spatial_bsptree_node *node = stk[--sp];
+
+        /* Bbox cull: skip entire subtree if query doesn't overlap node bounds */
+        if (SPATIAL_UNLIKELY(!spatial_bbox_overlaps(node->min, node->max, qmin, qmax,
+                                                     SPATIAL_BSPTREE_DIMS))) {
+            continue;
+        }
 
         if (node->is_leaf) {
             for (int i = 0; i < node->item_count; i++) {
