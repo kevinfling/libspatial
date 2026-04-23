@@ -36,17 +36,29 @@
         __asm__ volatile("lfence\n\trdtsc" : "=a"(lo), "=d"(hi));
         return ((uint64_t)hi << 32) | lo;
     }
+    static inline double timer_hz(void) {
+        /* Approximate; rdtsc runs at CPU clock. Calibrate if precision matters. */
+        return 3.0e9;
+    }
 #elif defined(__aarch64__)
     static inline uint64_t rdtsc(void) {
         uint64_t val;
         __asm__ volatile("mrs %0, cntvct_el0" : "=r"(val));
         return val;
     }
+    static inline double timer_hz(void) {
+        uint64_t freq;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        return (double)freq;
+    }
 #else
     static inline uint64_t rdtsc(void) {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    }
+    static inline double timer_hz(void) {
+        return 1.0e9;
     }
 #endif
 
@@ -75,8 +87,7 @@ typedef struct {
 } bench_result;
 
 static double cycles_to_ns(uint64_t cycles) {
-    /* Approximate - assumes 3GHz CPU */
-    return (double)cycles / 3.0;
+    return (double)cycles / (timer_hz() / 1.0e9);
 }
 
 static void print_header(void) {
@@ -111,7 +122,7 @@ static void random_aabb(double *min, double *max, int dims, double range) {
 }
 
 /* Callback that just counts */
-static int g_hit_count = 0;
+static volatile int g_hit_count = 0;
 static bool count_callback(const spatial_num_t *min, const spatial_num_t *max,
                            spatial_data_t data, void *udata) {
     (void)min; (void)max; (void)data; (void)udata;
@@ -389,6 +400,8 @@ static bench_result bench_hilbertrtree(int num_items) {
     r.insert_cycles = (end - start) / num_items;
     r.insert_ns = cycles_to_ns(r.insert_cycles);
     
+    spatial_hilbertrtree_rebuild(rt);
+    
     /* Search */
     double qmin[2], qmax[2];
     random_aabb(qmin, qmax, 2, 10000.0);
@@ -556,7 +569,7 @@ int main(int argc, char **argv) {
     printf("libspatial Performance Benchmark v%s\n", LIBSPATIAL_VERSION_STRING);
     printf("=================================================================\n");
     printf("Items: %d, Queries: %d\n", num_items, BENCH_NUM_QUERIES);
-    printf("(Cycles measured at ~3GHz, lower is better)\n");
+    printf("(Timer ticks; ns conversion uses actual counter frequency)\n");
     
     print_header();
     
