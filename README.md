@@ -164,8 +164,8 @@ For example, to use `float` coordinates and a smaller node capacity:
 | BSP-Tree | 2D/3D | Visibility, CSG, collision |
 | BVH | 3D | Physics engines, ray tracing |
 
-Quadtree, octree, orthtree, kd-tree, vp-tree, and hilbert r-tree are fully
-tested. BSP-tree and BVH headers are present but still being validated.
+Quadtree, octree, orthtree, kd-tree, vp-tree, hilbert r-tree, bsp-tree, and
+bvh are all tested and functional.
 
 ## Building
 
@@ -206,6 +206,7 @@ Octree:
 
 Orthtree:
   Running orthtree_basic... PASSED
+  Running orthtree_empty... PASSED
 
 KD-Tree:
   Running kdtree_basic... PASSED
@@ -218,8 +219,15 @@ VP-Tree:
 Hilbert R-Tree:
   Running hilbertrtree_basic... PASSED
 
+BSP-Tree:
+  Running bsptree_basic... PASSED
+
+BVH:
+  Running bvh_basic... PASSED
+  Running bvh_ray_intersect... PASSED
+
 =================================================================
-Results: 18 tests run, 18 passed, 0 failed
+Results: 22 tests run, 22 passed, 0 failed
 =================================================================
 ```
 
@@ -236,17 +244,18 @@ Output on Linux x86-64 (AMD Ryzen, ~3GHz):
 libspatial Performance Benchmark v0.1.0
 =================================================================
 Items: 100000, Queries: 10000
-(Cycles measured at ~3GHz, lower is better)
+(Timer ticks; ns conversion uses actual counter frequency)
 
 Structure             Insert(cyc)  Search(cyc)    Scan(cyc)   Insert(ns)   Search(ns)     Scan(ns)
 -------------------- ------------ ------------ ------------ ------------ ------------ ------------
-Quadtree                     11.0          3.0          3.0          3.7          1.0          1.0
-Octree                       10.0          6.0          3.0          3.3          2.0          1.0
-KD-Tree                      23.0       5479.0          0.0          7.7       1826.3          0.0
-VP-Tree                      28.0          7.0          0.0          9.3          2.3          0.0
-Hilbert R-Tree               70.0       7656.0          0.0         23.3       2552.0          0.0
-BSP-Tree                      1.0       4047.0          0.0          0.3       1349.0          0.0
-BVH                           2.0       7184.0          0.0          0.7       2394.7          0.0
+Quadtree                     12.0          4.0          6.0        384.0        128.0        192.0
+Octree                        8.0         12.0          6.0        256.0        384.0        192.0
+Orthtree                     18.0         10.0          1.0        576.0        320.0         32.0
+KD-Tree                      21.0          6.0          1.0        672.0        192.0         32.0
+VP-Tree                      25.0          5.0          0.0        800.0        160.0          0.0
+Hilbert R-Tree               48.0         23.0          0.0       1536.0        736.0          0.0
+BSP-Tree                      1.0          3.0          0.0         32.0         96.0          0.0
+BVH                           1.0          6.0          0.0         32.0        192.0          0.0
 ```
 
 Notes on the above:
@@ -257,8 +266,8 @@ Notes on the above:
   `spatial_bvh_build()`.
 - Scan times for some structures round to zero because the per-item cost is
   below the timer resolution on this workload.
-- Arena builds are typically 2-5x faster than plain `malloc` for batch
-  insertion workloads.
+- Arena builds are typically 1.0-1.1× vs plain `malloc` on this workload
+  (the allocator path is not yet hot enough to show large gains).
 
 ## API Reference
 

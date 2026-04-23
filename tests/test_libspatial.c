@@ -536,6 +536,110 @@ TEST(hilbertrtree_basic) {
 }
 
 /* ============================================================================
+ * BSP-Tree Tests
+ * ============================================================================ */
+
+TEST(bsptree_basic) {
+    spatial_bsptree *bsp = spatial_bsptree_new();
+    ASSERT_NE(bsp, NULL);
+    ASSERT_EQ(spatial_bsptree_count(bsp), 0);
+    
+    /* Insert 50 items in 3D */
+    for (int i = 0; i < 50; i++) {
+        double min[3] = {(double)i, 0.0, 0.0};
+        double max[3] = {(double)(i + 1), 1.0, 1.0};
+        ASSERT(spatial_bsptree_insert(bsp, min, max, (void*)(intptr_t)(i + 1)));
+    }
+    ASSERT_EQ(spatial_bsptree_count(bsp), 50);
+    
+    /* Before rebuild, search still works (linear scan of root leaf) */
+    double qmin[3] = {10.0, 0.0, 0.0};
+    double qmax[3] = {20.0, 1.0, 1.0};
+    g_callback_count = 0;
+    spatial_bsptree_search(bsp, qmin, qmax, count_callback, NULL);
+    /* Items [9,10] through [20,21] all touch or overlap [10,20] = 12 items */
+    ASSERT_EQ(g_callback_count, 12);
+    
+    /* Rebuild the tree */
+    spatial_bsptree_rebuild(bsp);
+    
+    /* Search after rebuild */
+    g_callback_count = 0;
+    spatial_bsptree_search(bsp, qmin, qmax, count_callback, NULL);
+    ASSERT_EQ(g_callback_count, 12);
+    
+    /* Scan all */
+    g_callback_count = 0;
+    spatial_bsptree_scan(bsp, count_callback, NULL);
+    ASSERT_EQ(g_callback_count, 50);
+    
+    spatial_bsptree_free(bsp);
+}
+
+/* ============================================================================
+ * BVH Tests
+ * ============================================================================ */
+
+TEST(bvh_basic) {
+    spatial_bvh *bvh = spatial_bvh_new();
+    ASSERT_NE(bvh, NULL);
+    ASSERT_EQ(spatial_bvh_count(bvh), 0);
+    
+    /* Insert 100 items in 3D */
+    for (int i = 0; i < 100; i++) {
+        double min[3] = {(double)(i * 10), (double)(i * 10), 0.0};
+        double max[3] = {(double)(i * 10 + 5), (double)(i * 10 + 5), 1.0};
+        ASSERT(spatial_bvh_insert(bvh, min, max, (void*)(intptr_t)(i + 1)));
+    }
+    ASSERT_EQ(spatial_bvh_count(bvh), 100);
+    
+    /* Build the BVH */
+    ASSERT(spatial_bvh_build(bvh));
+    
+    /* Search */
+    double qmin[3] = {0, 0, 0};
+    double qmax[3] = {50, 50, 1};
+    g_callback_count = 0;
+    spatial_bvh_search(bvh, qmin, qmax, count_callback, NULL);
+    ASSERT_EQ(g_callback_count, 6);
+    
+    /* Scan all */
+    g_callback_count = 0;
+    spatial_bvh_scan(bvh, count_callback, NULL);
+    ASSERT_EQ(g_callback_count, 100);
+    
+    spatial_bvh_free(bvh);
+}
+
+TEST(bvh_ray_intersect) {
+    spatial_bvh *bvh = spatial_bvh_new();
+    ASSERT_NE(bvh, NULL);
+    
+    /* Insert a few axis-aligned boxes along x-axis */
+    for (int i = 0; i < 10; i++) {
+        double min[3] = {(double)(i * 10), -1.0, -1.0};
+        double max[3] = {(double)(i * 10 + 5), 1.0, 1.0};
+        ASSERT(spatial_bvh_insert(bvh, min, max, (void*)(intptr_t)(i + 1)));
+    }
+    ASSERT(spatial_bvh_build(bvh));
+    
+    /* Shoot a ray along +x axis from origin */
+    spatial_bvh_ray ray;
+    ray.origin[0] = -5.0; ray.origin[1] = 0.0; ray.origin[2] = 0.0;
+    ray.dir[0] = 1.0; ray.dir[1] = 0.0; ray.dir[2] = 0.0;
+    ray.inv_dir[0] = 1.0; ray.inv_dir[1] = 1e30; ray.inv_dir[2] = 1e30;
+    ray.tmin = 0.0;
+    ray.tmax = 1000.0;
+    
+    spatial_bvh_hit hit;
+    bool found = spatial_bvh_intersect_ray(bvh, &ray, &hit);
+    ASSERT_EQ(found, true);
+    ASSERT_EQ(hit.prim_id >= 0 && hit.prim_id < 10, true);
+    
+    spatial_bvh_free(bvh);
+}
+
+/* ============================================================================
  * Main
  * ============================================================================ */
 
@@ -582,11 +686,11 @@ int main(int argc, char **argv) {
     RUN_TEST(hilbertrtree_basic);
     
     printf("\nBSP-Tree:\n");
-    //RUN_TEST(bsptree_basic);
+    RUN_TEST(bsptree_basic);
     
     printf("\nBVH:\n");
-    //RUN_TEST(bvh_basic);
-    //RUN_TEST(bvh_ray_intersect);
+    RUN_TEST(bvh_basic);
+    RUN_TEST(bvh_ray_intersect);
     
     printf("\n=================================================================\n");
     printf("Results: %d tests run, %d passed, %d failed\n", 
