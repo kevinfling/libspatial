@@ -207,9 +207,11 @@ typedef struct {
 
 SPATIAL_INLINE spatial_num_t spatial_bvh_eval_sah(spatial_bvh_bucket *buckets,
                                                    int num_buckets,
-                                                   spatial_num_t total_sa)
+                                                   spatial_num_t total_sa,
+                                                   int *out_split)
 {
     spatial_num_t min_cost = SPATIAL_INFINITY;
+    int best_split = 1;
     
     for (int i = 1; i < num_buckets; i++) {
         spatial_num_t left_min[SPATIAL_BVH_DIMS];
@@ -252,9 +254,13 @@ SPATIAL_INLINE spatial_num_t spatial_bvh_eval_sah(spatial_bvh_bucket *buckets,
                                                SPATIAL_BVH_TRAVERSAL_COST,
                                                SPATIAL_BVH_INTERSECTION_COST);
         
-        min_cost = spatial_min(min_cost, cost);
+        if (cost < min_cost) {
+            min_cost = cost;
+            best_split = i;
+        }
     }
     
+    if (out_split) *out_split = best_split;
     return min_cost;
 }
 
@@ -463,28 +469,16 @@ SPATIAL_INLINE int spatial_bvh_build_recursive(spatial_bvh *bvh,
     /* Find best split using SAH */
     spatial_num_t best_cost = SPATIAL_INFINITY;
     int best_axis = -1;
-    int best_split = -1;
+    int best_split_bucket = 1;
+    int best_bucket_counts[SPATIAL_BVH_NUM_BUCKETS];
     
     spatial_num_t total_sa = spatial_bvh_compute_sa(node->min, node->max);
     
-    /* Sort by each axis using pre-allocated scratch arrays */
     for (int axis = 0; axis < SPATIAL_BVH_DIMS; axis++) {
-        for (int i = 0; i < count; i++) {
-            scratch_d[i] = (double)bvh->prims[bvh->indices[start + i]].center[axis];
-            scratch_i[i] = bvh->indices[start + i];
-        }
-
-        int mid = count / 2;
-        spatial_quickselect_double(scratch_d, scratch_i, 0, count - 1, mid);
-
-        /* Copy back to indices for bucket evaluation */
-        for (int i = 0; i < count; i++) {
-            bvh->indices[start + i] = scratch_i[i];
-        }
-
-        /* Build buckets */
         spatial_bvh_bucket buckets[SPATIAL_BVH_NUM_BUCKETS];
+        int bucket_counts[SPATIAL_BVH_NUM_BUCKETS];
         memset(buckets, 0, sizeof(buckets));
+        memset(bucket_counts, 0, sizeof(bucket_counts));
 
         spatial_num_t axis_min = node->min[axis];
         spatial_num_t axis_max = node->max[axis];
@@ -509,51 +503,53 @@ SPATIAL_INLINE int spatial_bvh_build_recursive(spatial_bvh *bvh,
                 }
             }
             b->count++;
+            bucket_counts[bucket_idx]++;
         }
 
-        spatial_num_t cost = spatial_bvh_eval_sah(buckets, SPATIAL_BVH_NUM_BUCKETS, total_sa);
+        int split_bucket;
+        spatial_num_t cost = spatial_bvh_eval_sah(buckets, SPATIAL_BVH_NUM_BUCKETS, total_sa, &split_bucket);
 
         if (cost < best_cost) {
             best_cost = cost;
             best_axis = axis;
-            best_split = start + mid;
-
-            if (best_split <= start || best_split >= end) {
-                best_split = start + count / 2;
-            }
+            best_split_bucket = split_bucket;
+            memcpy(best_bucket_counts, bucket_counts, sizeof(bucket_counts));
         }
     }
-
-    if (best_axis < 0 || best_split <= start || best_split >= end) {
+    
+    int best_split;
+    if (best_axis < 0) {
         /* Fallback to middle split on longest axis */
-        best_split = start + count / 2;
+        best_axis = 0;
         spatial_num_t best_range = (spatial_num_t)0.0;
-        int long_axis = 0;
         for (int d = 0; d < SPATIAL_BVH_DIMS; d++) {
             spatial_num_t r = node->max[d] - node->min[d];
             if (r > best_range) {
                 best_range = r;
-                long_axis = d;
+                best_axis = d;
             }
         }
-        for (int i = 0; i < count; i++) {
-            scratch_d[i] = (double)bvh->prims[bvh->indices[start + i]].center[long_axis];
-            scratch_i[i] = bvh->indices[start + i];
-        }
-        spatial_quickselect_double(scratch_d, scratch_i, 0, count - 1, count / 2);
-        for (int i = 0; i < count; i++) {
-            bvh->indices[start + i] = scratch_i[i];
-        }
+        best_split = start + count / 2;
     } else {
-        /* Re-sort by best axis */
-        for (int i = 0; i < count; i++) {
-            scratch_d[i] = (double)bvh->prims[bvh->indices[start + i]].center[best_axis];
-            scratch_i[i] = bvh->indices[start + i];
+        /* Compute split position from best bucket boundary */
+        int left_count = 0;
+        for (int b = 0; b < best_split_bucket; b++) {
+            left_count += best_bucket_counts[b];
         }
-        spatial_quickselect_double(scratch_d, scratch_i, 0, count - 1, best_split - start);
-        for (int i = 0; i < count; i++) {
-            bvh->indices[start + i] = scratch_i[i];
+        best_split = start + left_count;
+        if (best_split <= start || best_split >= end) {
+            best_split = start + count / 2;
         }
+    }
+    
+    /* Sort by best axis so left half comes first */
+    for (int i = 0; i < count; i++) {
+        scratch_d[i] = (double)bvh->prims[bvh->indices[start + i]].center[best_axis];
+        scratch_i[i] = bvh->indices[start + i];
+    }
+    spatial_quickselect_double(scratch_d, scratch_i, 0, count - 1, best_split - start);
+    for (int i = 0; i < count; i++) {
+        bvh->indices[start + i] = scratch_i[i];
     }
 
     /* Create children */
@@ -620,13 +616,17 @@ SPATIAL_INLINE void spatial_bvh_search(const spatial_bvh *bvh,
 {
     if (SPATIAL_UNLIKELY(!bvh || !bvh->built || !bvh->nodes || !iter)) return;
 
+    spatial_bvh_node *SPATIAL_RESTRICT nodes = bvh->nodes;
+    int *SPATIAL_RESTRICT indices = bvh->indices;
+    spatial_bvh_prim *SPATIAL_RESTRICT prims = bvh->prims;
+
     int stk[SPATIAL_BVH_MAX_DEPTH * 2 + 4];
     int sp = 0;
     stk[sp++] = 0; /* root */
 
     while (sp > 0) {
         int node_idx = stk[--sp];
-        spatial_bvh_node *node = &bvh->nodes[node_idx];
+        spatial_bvh_node *node = &nodes[node_idx];
 
         if (SPATIAL_UNLIKELY(!spatial_bbox_overlaps(node->min, node->max, qmin, qmax,
                                                      SPATIAL_BVH_DIMS))) {
@@ -635,15 +635,21 @@ SPATIAL_INLINE void spatial_bvh_search(const spatial_bvh *bvh,
 
         if (SPATIAL_LIKELY(spatial_bvh_node_is_leaf(node))) {
             for (int i = 0; i < node->prim_count; i++) {
-                int prim_idx = bvh->indices[node->prim_offset + i];
-                spatial_bvh_prim *p = &bvh->prims[prim_idx];
+                int prim_idx = indices[node->prim_offset + i];
+                spatial_bvh_prim *p = &prims[prim_idx];
                 if (spatial_bbox_overlaps(p->min, p->max, qmin, qmax, SPATIAL_BVH_DIMS)) {
                     if (!iter(p->min, p->max, p->data, udata)) return;
                 }
             }
         } else {
-            if (node->left_child  >= 0) stk[sp++] = node->left_child;
-            if (node->right_child >= 0) stk[sp++] = node->right_child;
+            if (node->left_child  >= 0) {
+                SPATIAL_PREFETCH(&nodes[node->left_child], 0, 1);
+                stk[sp++] = node->left_child;
+            }
+            if (node->right_child >= 0) {
+                SPATIAL_PREFETCH(&nodes[node->right_child], 0, 1);
+                stk[sp++] = node->right_child;
+            }
         }
     }
 }
@@ -655,18 +661,22 @@ SPATIAL_INLINE void spatial_bvh_scan(const spatial_bvh *bvh,
 {
     if (SPATIAL_UNLIKELY(!bvh || !bvh->built || !bvh->nodes || !iter)) return;
 
+    spatial_bvh_node *SPATIAL_RESTRICT nodes = bvh->nodes;
+    int *SPATIAL_RESTRICT indices = bvh->indices;
+    spatial_bvh_prim *SPATIAL_RESTRICT prims = bvh->prims;
+
     int stk[SPATIAL_BVH_MAX_DEPTH * 2 + 4];
     int sp = 0;
     stk[sp++] = 0;
 
     while (sp > 0) {
         int node_idx = stk[--sp];
-        spatial_bvh_node *node = &bvh->nodes[node_idx];
+        spatial_bvh_node *node = &nodes[node_idx];
 
         if (SPATIAL_LIKELY(spatial_bvh_node_is_leaf(node))) {
             for (int i = 0; i < node->prim_count; i++) {
-                int prim_idx = bvh->indices[node->prim_offset + i];
-                spatial_bvh_prim *p = &bvh->prims[prim_idx];
+                int prim_idx = indices[node->prim_offset + i];
+                spatial_bvh_prim *p = &prims[prim_idx];
                 if (!iter(p->min, p->max, p->data, udata)) return;
             }
         } else {
