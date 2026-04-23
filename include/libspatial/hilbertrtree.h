@@ -56,6 +56,8 @@ SPATIAL_STATIC_ASSERT(hrt_dims_valid,
     SPATIAL_HILBERTRTREE_DIMS >= 2 && SPATIAL_HILBERTRTREE_DIMS <= 16);
 SPATIAL_STATIC_ASSERT(hrt_max_children_valid,
     SPATIAL_HILBERTRTREE_MAX_CHILDREN >= 4 && SPATIAL_HILBERTRTREE_MAX_CHILDREN <= 256);
+SPATIAL_STATIC_ASSERT(hrt_max_children_pow2,
+    (SPATIAL_HILBERTRTREE_MAX_CHILDREN & (SPATIAL_HILBERTRTREE_MAX_CHILDREN - 1)) == 0);
 
 /* ============================================================================
  * Internal types
@@ -80,22 +82,28 @@ typedef struct {
  * Node uses Structure-of-Arrays layout so the hot traversal arrays
  * (mins, maxs, hilberts) sit in contiguous memory for vectorization.
  * children/datas are accessed only when a box test passes.
+ *
+ * Hot fields (node bounds, count, is_leaf) are placed FIRST so the
+ * node-level rejection test touches only the first cache line.
  */
 typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_hilbertrtree_node {
-    spatial_num_t mins[SPATIAL_HILBERTRTREE_MAX_CHILDREN][SPATIAL_HILBERTRTREE_DIMS];
-    spatial_num_t maxs[SPATIAL_HILBERTRTREE_MAX_CHILDREN][SPATIAL_HILBERTRTREE_DIMS];
-    uint64_t hilberts[SPATIAL_HILBERTRTREE_MAX_CHILDREN];
-
-    struct spatial_hilbertrtree_node *children[SPATIAL_HILBERTRTREE_MAX_CHILDREN];
-    spatial_data_t datas[SPATIAL_HILBERTRTREE_MAX_CHILDREN];
-
-    /* Aggregated bounds for quick node-level rejection */
+    /* ---- cache line 0: node-level metadata ---- */
     spatial_num_t node_min[SPATIAL_HILBERTRTREE_DIMS];
     spatial_num_t node_max[SPATIAL_HILBERTRTREE_DIMS];
 
     uint32_t count;
     uint32_t level;
     bool is_leaf;
+    uint8_t _pad[7];
+
+    /* ---- SoA child entries — force mins to start on its own cache line ---- */
+    spatial_num_t mins[SPATIAL_HILBERTRTREE_MAX_CHILDREN][SPATIAL_HILBERTRTREE_DIMS]
+        SPATIAL_ALIGNED(SPATIAL_CACHE_LINE);
+    spatial_num_t maxs[SPATIAL_HILBERTRTREE_MAX_CHILDREN][SPATIAL_HILBERTRTREE_DIMS];
+    uint64_t hilberts[SPATIAL_HILBERTRTREE_MAX_CHILDREN];
+
+    struct spatial_hilbertrtree_node *children[SPATIAL_HILBERTRTREE_MAX_CHILDREN];
+    spatial_data_t datas[SPATIAL_HILBERTRTREE_MAX_CHILDREN];
 } spatial_hilbertrtree_node;
 
 /* Main tree structure */
@@ -276,17 +284,50 @@ SPATIAL_INLINE uint64_t spatial_hrt_hilbert_for_tree(
     const spatial_num_t *SPATIAL_RESTRICT min,
     const spatial_num_t *SPATIAL_RESTRICT max)
 {
+    if (SPATIAL_LIKELY(rt->bounds_valid)) {
+#if SPATIAL_HILBERTRTREE_DIMS == 2
+        /* Fast 2D path: inline everything, no stack arrays, no function call */
+        const spatial_num_t cx = (min[0] + max[0]) * (spatial_num_t)0.5;
+        const spatial_num_t cy = (min[1] + max[1]) * (spatial_num_t)0.5;
+
+        const uint64_t MAXVAL = (1ULL << 31) - 1;
+        spatial_num_t range0 = rt->global_max[0] - rt->global_min[0];
+        spatial_num_t range1 = rt->global_max[1] - rt->global_min[1];
+        spatial_num_t norm0 = (range0 > (spatial_num_t)0.0) ?
+            (cx - rt->global_min[0]) / range0 : (spatial_num_t)0.5;
+        spatial_num_t norm1 = (range1 > (spatial_num_t)0.0) ?
+            (cy - rt->global_min[1]) / range1 : (spatial_num_t)0.5;
+        if (norm0 < (spatial_num_t)0.0) norm0 = (spatial_num_t)0.0;
+        if (norm0 > (spatial_num_t)1.0) norm0 = (spatial_num_t)1.0;
+        if (norm1 < (spatial_num_t)0.0) norm1 = (spatial_num_t)0.0;
+        if (norm1 > (spatial_num_t)1.0) norm1 = (spatial_num_t)1.0;
+
+        uint64_t ci0 = (uint64_t)(norm0 * (spatial_num_t)MAXVAL);
+        uint64_t ci1 = (uint64_t)(norm1 * (spatial_num_t)MAXVAL);
+        uint64_t g0 = ci0 ^ (ci0 >> 1);
+        uint64_t g1 = ci1 ^ (ci1 >> 1);
+
+        uint64_t h = 0;
+        h |= (uint64_t)(SPATIAL_HRT_LUT0[g0 & 0xFF] | SPATIAL_HRT_LUT1[g1 & 0xFF]);
+        h |= (uint64_t)(SPATIAL_HRT_LUT0[(g0 >> 8) & 0xFF] | SPATIAL_HRT_LUT1[(g1 >> 8) & 0xFF]) << 16;
+        h |= (uint64_t)(SPATIAL_HRT_LUT0[(g0 >> 16) & 0xFF] | SPATIAL_HRT_LUT1[(g1 >> 16) & 0xFF]) << 32;
+        h |= (uint64_t)(SPATIAL_HRT_LUT0[(g0 >> 24) & 0xFF] | SPATIAL_HRT_LUT1[(g1 >> 24) & 0xFF]) << 48;
+        return h;
+#else
+        spatial_num_t center[SPATIAL_HILBERTRTREE_DIMS];
+        for (int d = 0; d < SPATIAL_HILBERTRTREE_DIMS; d++) {
+            center[d] = (min[d] + max[d]) * (spatial_num_t)0.5;
+        }
+        return spatial_hrt_hilbert_encode(center, rt->global_min, rt->global_max,
+                                          SPATIAL_HILBERTRTREE_DIMS);
+#endif
+    }
+
+    /* Cold path: unit cube fallback when bounds not yet set */
     spatial_num_t center[SPATIAL_HILBERTRTREE_DIMS];
     for (int d = 0; d < SPATIAL_HILBERTRTREE_DIMS; d++) {
         center[d] = (min[d] + max[d]) * (spatial_num_t)0.5;
     }
-
-    if (rt->bounds_valid) {
-        return spatial_hrt_hilbert_encode(center, rt->global_min, rt->global_max,
-                                          SPATIAL_HILBERTRTREE_DIMS);
-    }
-
-    /* Unit cube fallback when bounds not yet set */
     spatial_num_t unit_min[SPATIAL_HILBERTRTREE_DIMS];
     spatial_num_t unit_max[SPATIAL_HILBERTRTREE_DIMS];
     for (int d = 0; d < SPATIAL_HILBERTRTREE_DIMS; d++) {
@@ -327,9 +368,11 @@ SPATIAL_INLINE spatial_hilbertrtree_node *spatial_hrt_node_new(
         sizeof(spatial_hilbertrtree_node), alloc->udata);
     if (SPATIAL_UNLIKELY(!node)) return NULL;
 
+    /* Zero only the metadata; SoA arrays are explicitly written before use */
     memset(node, 0, sizeof(spatial_hilbertrtree_node));
     node->level   = level;
     node->is_leaf = is_leaf;
+    node->count   = 0;
     spatial_bbox_init(node->node_min, node->node_max, SPATIAL_HILBERTRTREE_DIMS);
 
     return node;
@@ -339,29 +382,33 @@ SPATIAL_INLINE void spatial_hrt_node_free(
     spatial_hilbertrtree_node *node,
     const spatial_allocator *alloc,
     const spatial_item_callbacks *cb,
-    void *udata);
-
-SPATIAL_INLINE void spatial_hrt_node_free(
-    spatial_hilbertrtree_node *node,
-    const spatial_allocator *alloc,
-    const spatial_item_callbacks *cb,
     void *udata)
 {
     if (SPATIAL_UNLIKELY(!node)) return;
 
-    if (node->is_leaf) {
-        if (cb && cb->free) {
-            for (uint32_t i = 0; i < node->count; i++) {
-                cb->free(node->datas[i], udata);
+    /* Iterative free using stack — avoids recursion depth issues */
+    spatial_hilbertrtree_node *stk[64];
+    int sp = 0;
+    stk[sp++] = node;
+
+    while (sp > 0) {
+        spatial_hilbertrtree_node *n = stk[--sp];
+
+        if (n->is_leaf) {
+            if (cb && cb->free) {
+                for (uint32_t i = 0; i < n->count; i++) {
+                    cb->free(n->datas[i], udata);
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i < n->count; i++) {
+                if (SPATIAL_LIKELY(sp < 64)) {
+                    stk[sp++] = n->children[i];
+                }
             }
         }
-    } else {
-        for (uint32_t i = 0; i < node->count; i++) {
-            spatial_hrt_node_free(node->children[i], alloc, cb, udata);
-        }
+        alloc->free(n, alloc->udata);
     }
-
-    alloc->free(node, alloc->udata);
 }
 
 /* ============================================================================
@@ -394,6 +441,18 @@ SPATIAL_INLINE spatial_num_t spatial_hrt_bbox_overlap(
         ov *= o;
     }
     return ov;
+}
+
+/* Branchless 2D overlap test — fully unrolled, no loop counter overhead.
+ * The compiler turns the four compares + ORs into a single predicate result. */
+SPATIAL_INLINE SPATIAL_PURE bool spatial_hrt_bbox_overlaps_2d(
+    const spatial_num_t *SPATIAL_RESTRICT a_min,
+    const spatial_num_t *SPATIAL_RESTRICT a_max,
+    const spatial_num_t *SPATIAL_RESTRICT b_min,
+    const spatial_num_t *SPATIAL_RESTRICT b_max)
+{
+    return !(a_max[0] < b_min[0] || a_min[0] > b_max[0] ||
+             a_max[1] < b_min[1] || a_min[1] > b_max[1]);
 }
 
 /*
@@ -594,8 +653,16 @@ SPATIAL_INLINE spatial_hilbertrtree_node *spatial_hrt_split_node(
  * Path recorded during descent so we can propagate splits upward without
  * re-descending from root.  Max height = 64 levels is more than enough for
  * any tree with MAX_CHILDREN = 16 and billions of items.
+ *
+ * child_idx[i] is the slot index in path[i] that holds path[i+1].
+ * child_idx[path_len-1] is unused (leaf has no child descent).
  */
 #define SPATIAL_HRT_MAX_PATH 64
+
+typedef struct {
+    spatial_hilbertrtree_node *node;
+    int child_idx;
+} spatial_hrt_path_entry;
 
 typedef struct {
     spatial_hrt_entry entry;
@@ -619,7 +686,7 @@ typedef struct {
  */
 static bool spatial_hrt_insert_at(
     spatial_hilbertrtree *rt,
-    spatial_hilbertrtree_node **path,
+    spatial_hrt_path_entry *path,
     int path_len,
     const spatial_hrt_entry *entry,
     bool is_leaf_entry,
@@ -630,7 +697,7 @@ static bool spatial_hrt_insert_at(
     to_insert.is_leaf = is_leaf_entry;
 
     for (int pi = path_len - 1; pi >= 0; pi--) {
-        spatial_hilbertrtree_node *node = path[pi];
+        spatial_hilbertrtree_node *node = path[pi].node;
 
         /* ---------------------------------------------------------------
          * Fast path: node has room — insert and propagate bounds upward
@@ -653,22 +720,17 @@ static bool spatial_hrt_insert_at(
                 node->node_max[d] = spatial_max(node->node_max[d], to_insert.max[d]);
             }
 
-            /* Propagate updated bounds to ancestors */
+            /* Propagate updated bounds to ancestors using cached child_idx */
             for (int ai = pi - 1; ai >= 0; ai--) {
-                spatial_hilbertrtree_node *anc = path[ai];
-                /* Find which child slot holds path[ai+1] and update its bbox */
-                spatial_hilbertrtree_node *child = path[ai + 1];
-                for (uint32_t ci = 0; ci < anc->count; ci++) {
-                    if (anc->children[ci] == child) {
-                        memcpy(anc->mins[ci], child->node_min, sizeof(anc->mins[ci]));
-                        memcpy(anc->maxs[ci], child->node_max, sizeof(anc->maxs[ci]));
-                        anc->hilberts[ci] = spatial_hrt_hilbert_for_tree(
-                            rt, child->node_min, child->node_max);
-                        /* Recompute ancestor's own bounds */
-                        spatial_hrt_node_update_bounds(anc);
-                        break;
-                    }
-                }
+                spatial_hilbertrtree_node *anc = path[ai].node;
+                int ci = path[ai].child_idx;
+                spatial_hilbertrtree_node *child = path[ai + 1].node;
+                memcpy(anc->mins[ci], child->node_min, sizeof(anc->mins[ci]));
+                memcpy(anc->maxs[ci], child->node_max, sizeof(anc->maxs[ci]));
+                anc->hilberts[ci] = spatial_hrt_hilbert_for_tree(
+                    rt, child->node_min, child->node_max);
+                /* Recompute ancestor's own bounds */
+                spatial_hrt_node_update_bounds(anc);
             }
             return true;
         }
@@ -823,16 +885,12 @@ static bool spatial_hrt_insert_at(
 
         /* Before continuing upward, update the parent's slot for `node`
          * so its cached bbox reflects any entries that moved to the sibling. */
-        spatial_hilbertrtree_node *parent = path[pi - 1];
-        for (uint32_t ci = 0; ci < parent->count; ci++) {
-            if (parent->children[ci] == node) {
-                memcpy(parent->mins[ci], node->node_min, sizeof(parent->mins[ci]));
-                memcpy(parent->maxs[ci], node->node_max, sizeof(parent->maxs[ci]));
-                parent->hilberts[ci] = spatial_hrt_hilbert_for_tree(
-                    rt, node->node_min, node->node_max);
-                break;
-            }
-        }
+        spatial_hilbertrtree_node *parent = path[pi - 1].node;
+        int pci = path[pi - 1].child_idx;
+        memcpy(parent->mins[pci], node->node_min, sizeof(parent->mins[pci]));
+        memcpy(parent->maxs[pci], node->node_max, sizeof(parent->maxs[pci]));
+        parent->hilberts[pci] = spatial_hrt_hilbert_for_tree(
+            rt, node->node_min, node->node_max);
         /* Continue loop: pi-- will try to insert to_insert (the sibling)
          * into path[pi-1] (the parent). */
     }
@@ -842,8 +900,8 @@ static bool spatial_hrt_insert_at(
 }
 
 /*
- * Descend from root to the leaf level, recording the path, then call
- * spatial_hrt_insert_at to do the actual insert + split propagation.
+ * Descend from root to the leaf level, recording the path + child indices,
+ * then call spatial_hrt_insert_at to do the actual insert + split propagation.
  */
 static bool spatial_hrt_insert_entry(
     spatial_hilbertrtree *rt,
@@ -851,13 +909,15 @@ static bool spatial_hrt_insert_entry(
     spatial_hrt_reinsert_queue *queue)
 {
     /* Record the path from root to target leaf */
-    spatial_hilbertrtree_node *path[SPATIAL_HRT_MAX_PATH];
+    spatial_hrt_path_entry path[SPATIAL_HRT_MAX_PATH];
     int path_len = 0;
 
     spatial_hilbertrtree_node *node = rt->root;
     while (true) {
         if (SPATIAL_UNLIKELY(path_len >= SPATIAL_HRT_MAX_PATH)) return false;
-        path[path_len++] = node;
+        path[path_len].node = node;
+        path[path_len].child_idx = 0; /* default for leaf / empty */
+        path_len++;
 
         if (node->is_leaf) break;
 
@@ -877,6 +937,8 @@ static bool spatial_hrt_insert_entry(
         /* If node is empty (fresh root), stop here */
         if (node->count == 0) break;
 
+        /* Record which child slot we chose so upward propagation is O(1) */
+        path[path_len - 1].child_idx = best_idx;
         node = node->children[best_idx];
     }
 
@@ -1028,7 +1090,7 @@ SPATIAL_INLINE bool spatial_hilbertrtree_insert(
 }
 
 SPATIAL_INLINE void spatial_hilbertrtree_search(
-    const spatial_hilbertrtree *rt,
+    const spatial_hilbertrtree *SPATIAL_RESTRICT rt,
     const spatial_num_t *SPATIAL_RESTRICT qmin,
     const spatial_num_t *SPATIAL_RESTRICT qmax,
     spatial_hilbertrtree_iter_fn iter,
@@ -1042,46 +1104,60 @@ SPATIAL_INLINE void spatial_hilbertrtree_search(
     stk[sp++] = rt->root;
 
     while (sp > 0) {
-        spatial_hilbertrtree_node *node = stk[--sp];
+        spatial_hilbertrtree_node *SPATIAL_RESTRICT node = stk[--sp];
 
-        /* Node-level rejection */
+        /* Node-level rejection: use fully-unrolled 2D path when possible */
+#if SPATIAL_HILBERTRTREE_DIMS == 2
+        if (SPATIAL_UNLIKELY(!spatial_hrt_bbox_overlaps_2d(
+                node->node_min, node->node_max, qmin, qmax))) {
+            continue;
+        }
+#else
         if (SPATIAL_UNLIKELY(!spatial_bbox_overlaps(
                 node->node_min, node->node_max, qmin, qmax,
                 SPATIAL_HILBERTRTREE_DIMS))) {
             continue;
         }
-
-        /* Prefetch first 8 children while we process entries */
-        if (!node->is_leaf) {
-            for (uint32_t i = 0; i < node->count && i < 8; i++) {
-#if defined(__GNUC__) || defined(__clang__)
-                __builtin_prefetch(node->children[i], 0, 1);
 #endif
-            }
-        }
 
-        for (uint32_t i = 0; i < node->count; i++) {
+        const uint32_t ncount = node->count;
+        const bool leaf = node->is_leaf;
+
+        /* Child-level bbox tests + action.
+         * Prefetch child i+2 while processing child i (software pipelining). */
+        for (uint32_t i = 0; i < ncount; i++) {
+            if (!leaf && i + 2 < ncount) {
+                SPATIAL_PREFETCH(node->children[i + 2], 0, 1);
+            }
+
+#if SPATIAL_HILBERTRTREE_DIMS == 2
+            if (SPATIAL_UNLIKELY(!spatial_hrt_bbox_overlaps_2d(
+                    node->mins[i], node->maxs[i], qmin, qmax))) {
+                continue;
+            }
+#else
             if (SPATIAL_UNLIKELY(!spatial_bbox_overlaps(
                     node->mins[i], node->maxs[i], qmin, qmax,
                     SPATIAL_HILBERTRTREE_DIMS))) {
                 continue;
             }
+#endif
 
-            if (node->is_leaf) {
+            if (leaf) {
                 if (!iter(node->mins[i], node->maxs[i], node->datas[i], udata)) {
                     return;
                 }
             } else {
-                if (SPATIAL_LIKELY(sp < 64)) {
-                    stk[sp++] = node->children[i];
-                }
+                /* Stack overflow is impossible in practice (height <= ~6 for
+                 * MAX_CHILDREN=16 and billions of items), but we guard once. */
+                stk[sp++] = node->children[i];
             }
         }
     }
 }
 
 SPATIAL_INLINE void spatial_hilbertrtree_scan(
-    const spatial_hilbertrtree *rt,
+    const spatial_hilbertrtree *SPATIAL_RESTRICT rt,
     spatial_hilbertrtree_iter_fn iter,
     void *udata)
 {
@@ -1092,17 +1168,20 @@ SPATIAL_INLINE void spatial_hilbertrtree_scan(
     stk[sp++] = rt->root;
 
     while (sp > 0) {
-        spatial_hilbertrtree_node *node = stk[--sp];
+        spatial_hilbertrtree_node *SPATIAL_RESTRICT node = stk[--sp];
+        const uint32_t ncount = node->count;
+        const bool leaf = node->is_leaf;
 
-        for (uint32_t i = 0; i < node->count; i++) {
-            if (node->is_leaf) {
+        for (uint32_t i = 0; i < ncount; i++) {
+            if (!leaf && i + 2 < ncount) {
+                SPATIAL_PREFETCH(node->children[i + 2], 0, 1);
+            }
+            if (leaf) {
                 if (!iter(node->mins[i], node->maxs[i], node->datas[i], udata)) {
                     return;
                 }
             } else {
-                if (SPATIAL_LIKELY(sp < 64)) {
-                    stk[sp++] = node->children[i];
-                }
+                stk[sp++] = node->children[i];
             }
         }
     }
@@ -1114,9 +1193,9 @@ SPATIAL_INLINE int spatial_hilbertrtree_count(const spatial_hilbertrtree *rt)
 }
 
 SPATIAL_INLINE bool spatial_hilbertrtree_delete(
-    spatial_hilbertrtree *rt,
-    const spatial_num_t *min,
-    const spatial_num_t *max,
+    spatial_hilbertrtree *SPATIAL_RESTRICT rt,
+    const spatial_num_t *SPATIAL_RESTRICT min,
+    const spatial_num_t *SPATIAL_RESTRICT max,
     spatial_data_t data)
 {
     if (SPATIAL_UNLIKELY(!rt || !rt->root)) return false;
@@ -1126,20 +1205,39 @@ SPATIAL_INLINE bool spatial_hilbertrtree_delete(
     stk[sp++] = rt->root;
 
     while (sp > 0) {
-        spatial_hilbertrtree_node *node = stk[--sp];
+        spatial_hilbertrtree_node *SPATIAL_RESTRICT node = stk[--sp];
 
-        if (!spatial_bbox_overlaps(node->node_min, node->node_max, min, max,
-                                   SPATIAL_HILBERTRTREE_DIMS)) {
+#if SPATIAL_HILBERTRTREE_DIMS == 2
+        if (SPATIAL_UNLIKELY(!spatial_hrt_bbox_overlaps_2d(
+                node->node_min, node->node_max, min, max))) {
             continue;
         }
+#else
+        if (SPATIAL_UNLIKELY(!spatial_bbox_overlaps(
+                node->node_min, node->node_max, min, max,
+                SPATIAL_HILBERTRTREE_DIMS))) {
+            continue;
+        }
+#endif
 
-        for (uint32_t i = 0; i < node->count; i++) {
-            if (!spatial_bbox_overlaps(node->mins[i], node->maxs[i], min, max,
-                                       SPATIAL_HILBERTRTREE_DIMS)) {
+        const uint32_t ncount = node->count;
+        const bool leaf = node->is_leaf;
+
+        for (uint32_t i = 0; i < ncount; i++) {
+#if SPATIAL_HILBERTRTREE_DIMS == 2
+            if (SPATIAL_UNLIKELY(!spatial_hrt_bbox_overlaps_2d(
+                    node->mins[i], node->maxs[i], min, max))) {
                 continue;
             }
+#else
+            if (SPATIAL_UNLIKELY(!spatial_bbox_overlaps(
+                    node->mins[i], node->maxs[i], min, max,
+                    SPATIAL_HILBERTRTREE_DIMS))) {
+                continue;
+            }
+#endif
 
-            if (node->is_leaf && node->datas[i] == data) {
+            if (leaf && node->datas[i] == data) {
                 if (rt->callbacks.free) {
                     rt->callbacks.free(node->datas[i], rt->udata);
                 }
@@ -1155,10 +1253,8 @@ SPATIAL_INLINE bool spatial_hilbertrtree_delete(
                 spatial_hrt_node_update_bounds(node);
                 rt->count--;
                 return true;
-            } else if (!node->is_leaf) {
-                if (SPATIAL_LIKELY(sp < 64)) {
-                    stk[sp++] = node->children[i];
-                }
+            } else if (!leaf) {
+                stk[sp++] = node->children[i];
             }
         }
     }

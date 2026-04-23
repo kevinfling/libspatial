@@ -237,25 +237,25 @@ Results: 22 tests run, 22 passed, 0 failed
 ./bench_libspatial 100000
 ```
 
-Output on Linux x86-64 (AMD Ryzen, ~3GHz):
+Output on Linux ARMv8 (AArch64, Apple M1-like, ~1.5GHz, `cntvct_el0` at 31.25 MHz):
 
 ```
 =================================================================
 libspatial Performance Benchmark v0.1.0
 =================================================================
-Items: 100000, Queries: 10000
+Items: 1000000, Queries: 10000
 (Timer ticks; ns conversion uses actual counter frequency)
 
 Structure             Insert(cyc)  Search(cyc)    Scan(cyc)   Insert(ns)   Search(ns)     Scan(ns)
 -------------------- ------------ ------------ ------------ ------------ ------------ ------------
-Quadtree                     13.0          4.0          6.0        416.0        128.0        192.0
-Octree                        9.0         11.0          4.0        288.0        352.0        128.0
-Orthtree                     19.0         10.0          1.0        608.0        320.0         32.0
-KD-Tree                      21.0          6.0          1.0        672.0        192.0         32.0
-VP-Tree                      25.0          6.0          0.0        800.0        192.0          0.0
-Hilbert R-Tree               48.0         23.0          0.0       1536.0        736.0          0.0
-BSP-Tree                      1.0          5.0          0.0         32.0        160.0          0.0
-BVH                           1.0          5.0          0.0         32.0        160.0          0.0
+Quadtree                     29.0         24.0          4.0        928.0        768.0        128.0
+Octree                       21.0          5.0          4.0        672.0        160.0        128.0
+Orthtree                     30.0         12.0          0.0        960.0        384.0          0.0
+KD-Tree                      57.0          7.0          1.0       1824.0        224.0         32.0
+VP-Tree                      68.0         15.0          1.0       2176.0        480.0         32.0
+Hilbert R-Tree               59.0         58.0          0.0       1888.0       1856.0          0.0
+BSP-Tree                      1.0          6.0          1.0         32.0        192.0         32.0
+BVH                           1.0          8.0          0.0         32.0        256.0          0.0
 ```
 
 Notes on the above:
@@ -266,7 +266,9 @@ Notes on the above:
   `spatial_bvh_build()`.
 - Scan times for some structures round to zero because the per-item cost is
   below the timer resolution on this workload.
-- Arena builds are typically 1.0-1.1× vs plain `malloc` on this workload
+- Arena builds are typically 1.0–1.1× vs plain `malloc` on this workload.
+- On this ARM platform `cntvct_el0` runs at 31.25 MHz, so each reported tick
+  corresponds to ~32 ns (or ~48 CPU cycles at ~1.5 GHz).
   (the allocator path is not yet hot enough to show large gains).
 
 ## API Reference
