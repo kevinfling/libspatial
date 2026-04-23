@@ -770,7 +770,7 @@ SPATIAL_INLINE double spatial_quickselect_double(double *arr, int *indices, int 
  * Stack Utilities (for non-recursive traversal)
  * ============================================================================ */
 
-typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_stack {
+typedef struct spatial_stack {
     void **items;
     int    capacity;
     int    top;
@@ -822,7 +822,7 @@ typedef struct spatial_pq_node {
     spatial_num_t  dist;
 } spatial_pq_node;
 
-typedef struct SPATIAL_ALIGNED(SPATIAL_CACHE_LINE) spatial_priority_queue {
+typedef struct spatial_priority_queue {
     spatial_pq_node  *nodes;
     int               size;
     int               capacity;

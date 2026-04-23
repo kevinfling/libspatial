@@ -217,28 +217,80 @@ TEST(octree_clone) {
 }
 
 /* ============================================================================
- * Hyperoctree Tests
+ * Orthtree Tests
  * ============================================================================ */
 
-TEST(hyperoctree_basic) {
+TEST(orthtree_basic) {
     /* Use 4D for testing */
-    #undef SPATIAL_HYPEROCTREE_DIMS
-    #define SPATIAL_HYPEROCTREE_DIMS 4
+    #undef SPATIAL_ORTHTREE_DIMS
+    #define SPATIAL_ORTHTREE_DIMS 4
     
-    spatial_hyperoctree *ht = spatial_hyperoctree_new();
+    spatial_orthtree *ht = spatial_orthtree_new();
     ASSERT_NE(ht, NULL);
     
-    double min[4] = {0, 0, 0, 0};
-    double max[4] = {1, 1, 1, 1};
-    
+    /* Insert 20 items along x-axis, each [i, i+1] × [0,1]³ */
     for (int i = 0; i < 20; i++) {
-        min[0] = (double)i;
-        spatial_hyperoctree_insert(ht, min, max, (void*)(intptr_t)(i + 1));
+        double min[4] = {(double)i, 0, 0, 0};
+        double max[4] = {(double)(i + 1), 1, 1, 1};
+        spatial_orthtree_insert(ht, min, max, (void*)(intptr_t)(i + 1));
     }
+    ASSERT_EQ(spatial_orthtree_count(ht), 20);
     
-    ASSERT_EQ(spatial_hyperoctree_count(ht), 20);
+    /* Search: query that overlaps items 5–15 (bboxes [4,5] through [14,15]) */
+    double qmin[4] = {4.5, 0, 0, 0};
+    double qmax[4] = {14.5, 1, 1, 1};
+    g_callback_count = 0;
+    spatial_orthtree_search(ht, qmin, qmax, count_callback, NULL);
+    ASSERT_EQ(g_callback_count, 11);
     
-    spatial_hyperoctree_free(ht);
+    /* Scan all items */
+    g_callback_count = 0;
+    spatial_orthtree_scan(ht, count_callback, NULL);
+    ASSERT_EQ(g_callback_count, 20);
+    
+    /* Iterator early-out */
+    int early = 0;
+    spatial_orthtree_scan(ht, stop_early_callback, &early);
+    ASSERT_EQ(early, 5);
+    
+    /* Delete specific item (item #6, bbox [5,6] × [0,1]³) */
+    double dmin[4] = {5, 0, 0, 0};
+    double dmax[4] = {6, 1, 1, 1};
+    bool deleted = spatial_orthtree_delete(ht, dmin, dmax, (void*)(intptr_t)6);
+    ASSERT_EQ(deleted, true);
+    ASSERT_EQ(spatial_orthtree_count(ht), 19);
+    
+    /* Verify deletion by re-searching */
+    g_callback_count = 0;
+    spatial_orthtree_search(ht, qmin, qmax, count_callback, NULL);
+    ASSERT_EQ(g_callback_count, 10);
+    
+    /* Delete non-existent item */
+    deleted = spatial_orthtree_delete(ht, dmin, dmax, (void*)(intptr_t)999);
+    ASSERT_EQ(deleted, false);
+    ASSERT_EQ(spatial_orthtree_count(ht), 19);
+    
+    spatial_orthtree_free(ht);
+}
+
+TEST(orthtree_empty) {
+    #undef SPATIAL_ORTHTREE_DIMS
+    #define SPATIAL_ORTHTREE_DIMS 4
+    
+    spatial_orthtree *ht = spatial_orthtree_new();
+    ASSERT_NE(ht, NULL);
+    ASSERT_EQ(spatial_orthtree_count(ht), 0);
+    
+    double qmin[4] = {0, 0, 0, 0};
+    double qmax[4] = {1, 1, 1, 1};
+    int found = 0;
+    spatial_orthtree_search(ht, qmin, qmax, count_callback, &found);
+    ASSERT_EQ(found, 0);
+    
+    spatial_orthtree_scan(ht, count_callback, &found);
+    ASSERT_EQ(found, 0);
+    
+    spatial_orthtree_free(ht);
 }
 
 /* ============================================================================
@@ -514,8 +566,9 @@ int main(int argc, char **argv) {
     RUN_TEST(octree_basic);
     RUN_TEST(octree_clone);
     
-    printf("\nHyperoctree:\n");
-    RUN_TEST(hyperoctree_basic);
+    printf("\nOrthtree:\n");
+    RUN_TEST(orthtree_basic);
+    RUN_TEST(orthtree_empty);
     
     printf("\nKD-Tree:\n");
     RUN_TEST(kdtree_basic);

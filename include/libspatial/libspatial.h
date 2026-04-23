@@ -28,7 +28,7 @@ extern "C" {
 /* Spatial indexing structures */
 #include "quadtree.h"
 #include "octree.h"
-#include "hyperoctree.h"
+#include "orthtree.h"
 #include "kdtree.h"
 #include "vptree.h"
 #include "hilbertrtree.h"
@@ -71,7 +71,7 @@ SPATIAL_INLINE libspatial_info libspatial_get_info(void) {
         .structures = {
             "quadtree (2D)",
             "octree (3D)",
-            "hyperoctree (N-D)",
+            "orthtree (N-D)",
             "kdtree (N-D)",
             "vptree (metric space)",
             "hilbertrtree (2D)",

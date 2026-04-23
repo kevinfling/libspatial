@@ -252,6 +252,65 @@ static bench_result bench_octree(int num_items) {
 }
 
 /* ============================================================================
+ * Orthtree Benchmark (4D default)
+ * ============================================================================ */
+
+static bench_result bench_orthtree(int num_items) {
+    bench_result r = {"Orthtree", 0, 0, 0, 0, 0, 0};
+    
+    spatial_orthtree *ot = spatial_orthtree_new();
+    if (!ot) return r;
+    
+    double *mins = malloc(num_items * 4 * 2 * sizeof(double));
+    double *maxs = mins + num_items * 4;
+    
+    for (int i = 0; i < num_items; i++) {
+        random_aabb(&mins[i * 4], &maxs[i * 4], 4, 10000.0);
+    }
+    
+    /* Warmup */
+    for (int i = 0; i < BENCH_WARMUP && i < num_items; i++) {
+        spatial_orthtree_insert(ot, &mins[i * 4], &maxs[i * 4], (void*)(intptr_t)i);
+    }
+    spatial_orthtree_free(ot);
+    ot = spatial_orthtree_new();
+    
+    /* Insert */
+    uint64_t start = rdtsc();
+    for (int i = 0; i < num_items; i++) {
+        spatial_orthtree_insert(ot, &mins[i * 4], &maxs[i * 4], (void*)(intptr_t)i);
+    }
+    uint64_t end = rdtsc();
+    r.insert_cycles = (end - start) / num_items;
+    r.insert_ns = cycles_to_ns(r.insert_cycles);
+    
+    /* Search */
+    double qmin[4], qmax[4];
+    random_aabb(qmin, qmax, 4, 10000.0);
+    
+    g_hit_count = 0;
+    start = rdtsc();
+    for (int i = 0; i < BENCH_NUM_QUERIES; i++) {
+        spatial_orthtree_search(ot, qmin, qmax, count_callback, NULL);
+    }
+    end = rdtsc();
+    r.search_cycles = (end - start) / BENCH_NUM_QUERIES;
+    r.search_ns = cycles_to_ns(r.search_cycles);
+    
+    /* Scan */
+    start = rdtsc();
+    spatial_orthtree_scan(ot, count_callback, NULL);
+    end = rdtsc();
+    r.scan_cycles = (end - start) / num_items;
+    r.scan_ns = cycles_to_ns(r.scan_cycles);
+    
+    free(mins);
+    spatial_orthtree_free(ot);
+    
+    return r;
+}
+
+/* ============================================================================
  * KD-Tree Benchmark
  * ============================================================================ */
 
@@ -579,6 +638,9 @@ int main(int argc, char **argv) {
     print_result(&r);
     
     r = bench_octree(num_items);
+    print_result(&r);
+    
+    r = bench_orthtree(num_items);
     print_result(&r);
     
     r = bench_kdtree(num_items);

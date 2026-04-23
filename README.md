@@ -9,7 +9,7 @@ all sharing a uniform API pattern.
 - Header-only - drop into your project and include
 - Strict C11 - compiles with `-std=c11 -pedantic -Wall -Wextra -Werror`
 - Zero dependencies - built-in arena and pool allocators
-- Eight spatial structures - quadtree, octree, hyperoctree, kd-tree, vp-tree,
+- Eight spatial structures - quadtree, octree, orthtree, kd-tree, vp-tree,
   hilbert r-tree, bsp-tree, and bvh
 - Cache-aligned node layouts
 - Non-recursive stack-based traversal
@@ -141,7 +141,7 @@ the header.
 | `SPATIAL_MAXITEMS` | Maximum items per node | `64` |
 | `SPATIAL_QUADTREE_MAX_DEPTH` | Quadtree max depth | `20` |
 | `SPATIAL_QUADTREE_MAX_ITEMS` | Quadtree node capacity | `16` |
-| `SPATIAL_HYPEROCTREE_DIMS` | Hyperoctree dimensionality | `4` |
+| `SPATIAL_ORTHTREE_DIMS` | Orthtree dimensionality | `4` |
 
 For example, to use `float` coordinates and a smaller node capacity:
 
@@ -157,14 +157,14 @@ For example, to use `float` coordinates and a smaller node capacity:
 | :--- | :--- | :--- |
 | Quadtree | 2D | Games, GIS, image processing |
 | Octree | 3D | Voxel engines, point clouds |
-| Hyperoctree | N-D | High-dimensional indexing |
+| Orthtree | N-D | High-dimensional indexing |
 | KD-Tree | N-D | Nearest neighbor, ray tracing |
 | VP-Tree | Metric space | Non-Euclidean distances |
 | Hilbert R-Tree | 2D | Range queries, spatial databases |
 | BSP-Tree | 2D/3D | Visibility, CSG, collision |
 | BVH | 3D | Physics engines, ray tracing |
 
-Quadtree, octree, hyperoctree, kd-tree, vp-tree, and hilbert r-tree are fully
+Quadtree, octree, orthtree, kd-tree, vp-tree, and hilbert r-tree are fully
 tested. BSP-tree and BVH headers are present but still being validated.
 
 ## Building
@@ -204,8 +204,8 @@ Octree:
   Running octree_basic... PASSED
   Running octree_clone... PASSED
 
-Hyperoctree:
-  Running hyperoctree_basic... PASSED
+Orthtree:
+  Running orthtree_basic... PASSED
 
 KD-Tree:
   Running kdtree_basic... PASSED
