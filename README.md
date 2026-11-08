@@ -335,3 +335,36 @@ Copyright (c) 2026 Kevin Fling
 ## Acknowledgments
 
 Inspired by [tidwall/rtree.c](https://github.com/tidwall/rtree.c).
+
+
+## Experimental packed N-D point BVH
+
+`#include <libspatial/packed_bvh.h>` provides a separate immutable point-index
+API without changing the existing `spatial_bvh_*` layout or 3D SAH path.
+It supports 1–256 dimensions and float32 row-major points. Optional
+64-bit spatial keys (e.g. generated with curves.h Hilbert/Morton encoders)
+control bulk-load ordering; `NULL` retains input order. Bounds and exact
+squared-L2 distances always use the original float32 vectors.
+
+```c
+spatial_packed_bvh index = {0};
+if (spatial_packed_bvh_build(&index, points, keys, n, dims, 64) == 0) {
+    spatial_packed_bvh_queue *queue = malloc(index.node_count * sizeof(*queue));
+    spatial_packed_bvh_hit hits[10];
+    size_t found = spatial_packed_bvh_knn(&index, query, 10, hits,
+        (spatial_packed_bvh_scratch){queue, index.node_count});
+    /* SIZE_MAX indicates invalid input or insufficient scratch */
+    free(queue);
+    spatial_packed_bvh_destroy(&index);
+}
+```
+
+The points array must remain valid and immutable for the index lifetime.
+The build allocates memory; search requires caller-owned scratch and allocates
+nothing. Search is exact squared-L2, not cosine. Key generation is external,
+and key ordering does not itself guarantee geometric locality.
+
+This experimental API uses libc malloc/free, unlike the configurable allocator
+used by the legacy BVH. It does not yet provide quantized bounds, multiword
+spatial keys, or a performance-parity guarantee. The included correctness test
+compares kNN results against exhaustive search.
