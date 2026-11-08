@@ -44,7 +44,7 @@ extern "C" {
 #endif
 
 SPATIAL_STATIC_ASSERT(bvh_dims_valid,
-    SPATIAL_BVH_DIMS > 0 && SPATIAL_BVH_DIMS <= 8);
+    SPATIAL_BVH_DIMS > 0 && SPATIAL_BVH_DIMS <= 256);
 
 /* Forward declarations */
 struct spatial_bvh_node;
@@ -466,6 +466,49 @@ SPATIAL_INLINE int spatial_bvh_build_recursive(spatial_bvh *bvh,
         return node_idx;
     }
     
+    /*
+     * Preserve the established bucketed-SAH builder for <=8 dimensions.
+     * Above that, select the axis with the widest centroid spread and use
+     * a balanced median split. This avoids O(dimensions^2) SAH work and
+     * degenerate high-dimensional surface-area products.
+     */
+    if (SPATIAL_BVH_DIMS > 8) {
+        int axis = 0;
+        spatial_num_t widest = (spatial_num_t)-1;
+        for (int d = 0; d < SPATIAL_BVH_DIMS; ++d) {
+            spatial_num_t lo = bvh->prims[bvh->indices[start]].center[d];
+            spatial_num_t hi = lo;
+            for (int i = start + 1; i < end; ++i) {
+                spatial_num_t v = bvh->prims[bvh->indices[i]].center[d];
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            if (hi - lo > widest) {
+                widest = hi - lo;
+                axis = d;
+            }
+        }
+        for (int i = 0; i < count; ++i) {
+            scratch_d[i] = (double)bvh->prims[bvh->indices[start + i]].center[axis];
+            scratch_i[i] = bvh->indices[start + i];
+        }
+        const int middle = count / 2;
+        spatial_quickselect_double(scratch_d, scratch_i, 0, count - 1, middle);
+        for (int i = 0; i < count; ++i)
+            bvh->indices[start + i] = scratch_i[i];
+
+        const int left = spatial_bvh_build_recursive(
+            bvh, start, start + middle, depth + 1, scratch_d, scratch_i);
+        if (left < 0) return -1;
+        const int right = spatial_bvh_build_recursive(
+            bvh, start + middle, end, depth + 1, scratch_d, scratch_i);
+        if (right < 0) return -1;
+        /* Recursive growth may have relocated bvh->nodes. */
+        bvh->nodes[node_idx].left_child = left;
+        bvh->nodes[node_idx].right_child = right;
+        return node_idx;
+    }
+
     /* Find best split using SAH */
     spatial_num_t best_cost = SPATIAL_INFINITY;
     int best_axis = -1;
@@ -553,9 +596,14 @@ SPATIAL_INLINE int spatial_bvh_build_recursive(spatial_bvh *bvh,
     }
 
     /* Create children */
-    node->left_child  = spatial_bvh_build_recursive(bvh, start,      best_split, depth + 1, scratch_d, scratch_i);
-    node->right_child = spatial_bvh_build_recursive(bvh, best_split, end,        depth + 1, scratch_d, scratch_i);
-    
+    const int left = spatial_bvh_build_recursive(bvh, start, best_split, depth + 1, scratch_d, scratch_i);
+    if (left < 0) return -1;
+    const int right = spatial_bvh_build_recursive(bvh, best_split, end, depth + 1, scratch_d, scratch_i);
+    if (right < 0) return -1;
+    /* Never retain a node pointer across recursive calls that can grow nodes. */
+    bvh->nodes[node_idx].left_child = left;
+    bvh->nodes[node_idx].right_child = right;
+
     return node_idx;
 }
 
