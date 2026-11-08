@@ -34,6 +34,7 @@ extern "C" {
 #include "hilbertrtree.h"
 #include "bsptree.h"
 #include "bvh.h"
+#include "packed_bvh.h"
 
 /* ============================================================================
  * Library Version
